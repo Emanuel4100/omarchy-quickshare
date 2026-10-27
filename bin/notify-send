@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# notify-send shim for quickshare-direct.
+#
+# quickshare-direct asks "accept this transfer?" with `notify-send --action=...`
+# and reads the chosen action key from stdout. Omarchy's notification popups
+# don't draw action buttons, so the question can't be answered and the transfer
+# times out. Here, a notification that carries actions becomes an Omarchy picker
+# (omarchy-menu-select) instead; everything else goes to the real notify-send.
+set -uo pipefail
+
+real=/usr/bin/notify-send
+log=${XDG_CACHE_HOME:-$HOME/.cache}/quickshare-direct/notify.log
+mkdir -p "${log%/*}" && { printf '%s' "$(date +%T)"; printf ' %q' "$@"; echo; } >> "$log" 2>/dev/null
+
+# quickshare-direct asks for the themed icon "network-wireless", which many icon
+# themes (Yaru included) don't have, so the popup shows none. Use our own icon.
+icon=$(dirname "$(dirname "$(readlink -f "$0")")")/assets/quickshare.svg
+args=()
+for ((i = 1; i <= $#; i++)); do
+  a=${!i}
+  case $a in
+    --icon=*) args+=("--icon=$icon") ;;
+    -i | --icon) args+=("$a" "$icon"); ((i++)) ;;
+    *) args+=("$a") ;;
+  esac
+done
+set -- "${args[@]}"
+
+keys=() labels=() positional=() expire=""
+for ((i = 0; i < ${#args[@]}; i++)); do
+  a=${args[i]}
+  case $a in
+    --action=*) spec=${a#--action=} ;;
+    -A | --action) spec=${args[++i]:-} ;;
+    --expire-time=*) expire=${a#--expire-time=}; continue ;;
+    -t) expire=${args[++i]:-}; continue ;;
+    -a | -i | -u | -c | -h | -r | -p | --app-name | --icon | --urgency | --category | --hint | --replace-id) ((i++)); continue ;;
+    -*) continue ;;
+    *) positional+=("$a"); continue ;;
+  esac
+  # notify-send's action syntax is [KEY=]Label; a bare label answers with its index.
+  if [[ $spec == *=* ]]; then keys+=("${spec%%=*}"); labels+=("${spec#*=}")
+  else keys+=("${#keys[@]}"); labels+=("$spec"); fi
+done
+
+(( ${#keys[@]} )) || exec "$real" "$@"
+
+# A single action ("Show in folder") isn't a question: keep it a normal toast,
+# renamed to "default" so clicking it (the only thing Omarchy popups do) runs it.
+if (( ${#keys[@]} == 1 )); then
+  plain=()
+  for ((i = 0; i < ${#args[@]}; i++)); do
+    case ${args[i]} in
+      --action=*) ;;
+      -A | --action) ((i++)) ;;
+      *) plain+=("${args[i]}") ;;
+    esac
+  done
+  # "Received from …" with body "photo.jpg (1.2 MB)": show the picture itself.
+  dl=$(xdg-user-dir DOWNLOAD 2>/dev/null || echo "$HOME/Downloads")
+  file=$dl/${positional[1]:-}; file=${file% (*}
+  case ${file,,} in
+    *.jpg | *.jpeg | *.png | *.webp | *.gif) [[ -f $file ]] && plain=(--hint="string:image-path:$file" "${plain[@]}") ;;
+  esac
+  reply=$("$real" --action="default=${labels[0]}" "${plain[@]}") || exit 0
+  [[ $reply == default ]] && printf '%s\n' "${keys[0]}"
+  exit 0
+fi
+
+summary=${positional[0]:-Quick Share}
+body=${positional[1]:-}
+prompt=$summary${body:+: $body}
+prompt=$(sed -e 's/<[^>]*>//g' <<< "$prompt" | paste -sd ' ')
+
+# Stop asking once the sender has given up (expire-time is in ms).
+secs=30
+[[ $expire =~ ^[0-9]+$ ]] && (( expire > 0 )) && secs=$(( (expire + 999) / 1000 ))
+
+choice=$(printf '%s\n' "${labels[@]}" | timeout "$secs" omarchy-menu-select "$prompt" -- --width 700) || exit 0
+for i in "${!labels[@]}"; do
+  [[ ${labels[i]} == "$choice" ]] && { printf '%s\n' "${keys[i]}"; exit 0; }
+done
+exit 0

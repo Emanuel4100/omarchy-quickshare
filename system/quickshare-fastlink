@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# quickshare-fastlink: Wi-Fi Direct link for Quick Share transfers that NetworkManager can't break.
+# Runs as root in place of quickshare-direct's /usr/lib/quickshare-direct/quickshare-ap (installed
+# by `quickshare fast on` as a drop-in for quickshare-ap@.service); derived from that helper (0.1.5).
+#
+# Why: NetworkManager owns wpa_supplicant's station interface and with it the P2P device, and it
+# tears down any Wi-Fi Direct group it didn't ask for ("P2P: WPA supplicant notified a group start
+# but we are not trying to connect! Ignoring the event." followed by AP-DISABLED a millisecond
+# later), so the upstream helper's group never lives long enough for the phone to join. Here the
+# station is taken away from NetworkManager for the transfer, we add it to wpa_supplicant
+# ourselves (D-Bus), host the group alone on a channel the phone can use, and give the station
+# back afterwards. The laptop's own Wi-Fi connection pauses while the link is up.
+#
+# Environment: QS_STA (station interface, default: first managed Wi-Fi interface),
+#              QS_GO_FREQS (group frequencies in order of preference, MHz; the first one our
+#              radio may transmit on is used; default "2437 2412 2462 5180 5745"),
+#              QS_USER (user who may read the credentials; quickshare-ap@USER sets it), else
+#              QS_GROUP (default users), QS_SUBNET (default 10.42.0),
+#              QS_NFT_CHAIN (see fw_allow).
+# Needs: iw, iproute2, dnsmasq, busctl (systemd), nmcli, wpa_supplicant with P2P + D-Bus.
+set -euo pipefail
+
+GROUP=${QS_GROUP:-users}
+[ -n "${QS_USER:-}" ] && GROUP=$(id -gn "$QS_USER")
+NET=${QS_SUBNET:-10.42.0}
+DIR=${RUNTIME_DIRECTORY:-/run/quickshare}
+mkdir -p "$DIR"
+STA=${QS_STA:-$(iw dev | awk '/Interface/{i=$2} /type managed/{print i; exit}')}
+[ -n "$STA" ] || { echo "quickshare-fastlink: no Wi-Fi station interface" >&2; exit 1; }
+
+WPAS=fi.w1.wpa_supplicant1
+# wpa_supplicant D-Bus object of an interface name (e.g. wlo1), or nothing.
+wpas_obj() {
+  local p
+  for p in $(busctl get-property $WPAS /fi/w1/wpa_supplicant1 $WPAS Interfaces | grep -o '"/[^"]*"' | tr -d '"'); do
+    [ "$(busctl get-property $WPAS "$p" $WPAS.Interface Ifname 2>/dev/null)" = "s \"$1\"" ] && { echo "$p"; return 0; }
+  done
+  return 1
+}
+
+# Let the phone reach us on the group interface: firewalld (trusted zone), ufw (allow in on it),
+# else an nftables rule in QS_NFT_CHAIN="family table chain" (skipped if that chain doesn't exist).
+NFT_CHAIN=${QS_NFT_CHAIN:-inet nixos-fw input-allow}
+fw_allow() {
+  if command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
+    firewall-cmd --zone=trusted --add-interface="$1" >/dev/null && FW_FIREWALLD=$1
+  elif command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw allow in on "$1" comment quickshare >/dev/null && FW_UFW=$1
+  elif command -v nft >/dev/null; then
+    # shellcheck disable=SC2086
+    NFT_HANDLE=$(nft --echo --handle insert rule $NFT_CHAIN iifname "$1" accept comment quickshare 2>/dev/null |
+      sed -n 's/.*# handle \([0-9]*\).*/\1/p') || true
+  fi
+}
+
+cleanup() {
+  set +e  # finish every step, above all giving the station back
+  [ -n "${FW_FIREWALLD:-}" ] && firewall-cmd --zone=trusted --remove-interface="$FW_FIREWALLD" >/dev/null 2>&1
+  [ -n "${FW_UFW:-}" ] && ufw delete allow in on "$FW_UFW" >/dev/null 2>&1
+  # shellcheck disable=SC2086
+  [ -n "${NFT_HANDLE:-}" ] && nft delete rule $NFT_CHAIN handle "$NFT_HANDLE" 2>/dev/null
+  [ -n "${DNSMASQ:-}" ] && kill "$DNSMASQ" 2>/dev/null
+  [ -n "${GOBJ:-}" ] && busctl call $WPAS "$GOBJ" $WPAS.Interface.P2PDevice Disconnect 2>/dev/null
+  rm -f "$DIR/credentials" "$DIR/leases"
+  if [ -n "${OWN_IFACE:-}" ]; then
+    busctl call $WPAS /fi/w1/wpa_supplicant1 $WPAS RemoveInterface o "$OWN_IFACE" 2>/dev/null
+  fi
+  if [ -n "${STA_UNMANAGED:-}" ]; then
+    echo "quickshare-fastlink: giving $STA back to NetworkManager${STA_CONN:+ (connection $STA_CONN)}"
+    nmcli device set "$STA" managed yes 2>/dev/null
+    if [ -z "${STA_CONN:-}" ] || ! nmcli -w 0 connection up uuid "$STA_CONN" ifname "$STA" >/dev/null 2>&1; then
+      nmcli -w 0 device connect "$STA" >/dev/null 2>&1
+    fi
+    rm -f "/run/quickshare-reconnect-$STA"
+  fi
+  return 0
+}
+trap cleanup EXIT
+trap 'exit 0' TERM INT
+
+# Take the station away from NetworkManager. Remember which connection was up, so the same one
+# comes back; if we die before giving it back, the unit's ExecStopPost does it from this marker.
+STA_CONN=$(nmcli -g UUID,DEVICE connection show --active 2>/dev/null |
+  awk -F: -v d="$STA" '$2 == d { print $1; exit }')
+echo "$STA_CONN" > "/run/quickshare-reconnect-$STA"
+for i in /sys/class/net/p2p-"$STA"-*; do [ -e "$i" ] && iw dev "${i##*/}" del 2>/dev/null; done
+echo "quickshare-fastlink: taking $STA from NetworkManager for the transfer"
+nmcli -w 10 device set "$STA" managed no
+STA_UNMANAGED=1
+for i in $(seq 50); do wpas_obj "$STA" >/dev/null || break; sleep 0.1; done
+
+# Add the station to wpa_supplicant ourselves; its P2P device comes with it.
+OWN_IFACE=$(busctl call $WPAS /fi/w1/wpa_supplicant1 $WPAS CreateInterface 'a{sv}' 2 \
+  Ifname s "$STA" Driver s nl80211 | sed -n 's/^o "\(.*\)"$/\1/p')
+[ -n "$OWN_IFACE" ] || { echo "quickshare-fastlink: wpa_supplicant wouldn't take $STA" >&2; exit 1; }
+
+# Whether we may start a network on a frequency: listed for our phy, and not marked "radar
+# detection" (DFS), "no IR" or "disabled" (iw phy: "* 5500.0 MHz [100] (26.0 dBm) (radar detection)").
+PHY=$(cat "/sys/class/net/$STA/phy80211/name" 2>/dev/null || true)
+PHYINFO=$(iw phy ${PHY:+"$PHY"} info 2>/dev/null || iw phy 2>/dev/null || true)
+usable() {
+  local l
+  l=$(printf '%s\n' "$PHYINFO" | grep -E "^[[:space:]]+\* $1(\.0)? MHz" | head -1)
+  [ -n "$l" ] && ! printf '%s\n' "$l" | grep -qE "radar detection|no IR|disabled"
+}
+# Phones only join a group on their "Wi-Fi Direct client usable" channels (a Galaxy S24 Ultra in
+# Israel: 2.4 GHz and 5180, not UNII-3), so 2.4 GHz comes first by default.
+GO_FREQ=
+for f in ${QS_GO_FREQS:-2437 2412 2462 5180 5745}; do
+  if usable "$f"; then GO_FREQ=$f; break; fi
+done
+[ -n "$GO_FREQ" ] || echo "quickshare-fastlink: none of QS_GO_FREQS is usable; wpa_supplicant picks a channel" >&2
+
+# Wi-Fi Direct group owner via wpa_supplicant; sets IF, SSID, PASS, GOBJ, GROUP_FREQ.
+start_p2p() {
+  local dev=$OWN_IFACE grp ssid_bytes i o1 o2 o3
+  # Hand the phone its address in the WPA handshake (no DHCP round inside Nearby's ~4 s join
+  # timeout); dnsmasq stays as the fallback for .10-.99.
+  IFS=. read -r o1 o2 o3 <<< "$NET"
+  busctl set-property $WPAS "$dev" $WPAS.Interface.P2PDevice P2PDeviceConfig 'a{sv}' 4 \
+      IpAddrGo ay 4 "$o1" "$o2" "$o3" 1 IpAddrMask ay 4 255 255 255 0 \
+      IpAddrStart ay 4 "$o1" "$o2" "$o3" 100 IpAddrEnd ay 4 "$o1" "$o2" "$o3" 199 2>/dev/null ||
+    echo "quickshare-fastlink: no EAPOL IP allocation; phones use DHCP" >&2
+  local f=() n=0
+  [ -n "$GO_FREQ" ] && { f=(frequency i "$GO_FREQ"); n=1; }
+  # Widest first: without ht40/vht/he the group runs 802.11n at 20 MHz.
+  busctl call $WPAS "$dev" $WPAS.Interface.P2PDevice GroupAdd 'a{sv}' $((n + 4)) \
+      persistent b false "${f[@]}" ht40 b true vht b true he b true >/dev/null ||
+    busctl call $WPAS "$dev" $WPAS.Interface.P2PDevice GroupAdd 'a{sv}' $((n + 3)) \
+      persistent b false "${f[@]}" ht40 b true vht b true >/dev/null ||
+    busctl call $WPAS "$dev" $WPAS.Interface.P2PDevice GroupAdd 'a{sv}' $((n + 1)) \
+      persistent b false "${f[@]}" >/dev/null || return 1
+  for i in $(seq 50); do
+    IF=$(ls /sys/class/net | grep "^p2p-$STA-" | head -1 || true)
+    [ -n "$IF" ] && GOBJ=$(wpas_obj "$IF") && break
+    sleep 0.1
+  done
+  [ -n "${GOBJ:-}" ] || { echo "quickshare-fastlink: P2P group interface didn't appear" >&2; return 1; }
+  for i in $(seq 50); do
+    grp=$(busctl get-property $WPAS "$GOBJ" $WPAS.Interface.P2PDevice Group 2>/dev/null | grep -o '"/[^"]*"' | tr -d '"' || true)
+    [ -n "$grp" ] && [ "$grp" != "/" ] && break
+    sleep 0.1
+  done
+  # SSID property is "ay N b1 b2 ...": bytes → string
+  ssid_bytes=$(busctl get-property $WPAS "$grp" $WPAS.Group SSID | cut -d' ' -f3-)
+  SSID=$(for b in $ssid_bytes; do printf "\\x$(printf %02x "$b")"; done)
+  PASS=$(busctl get-property $WPAS "$grp" $WPAS.Group Passphrase | sed 's/^s "\(.*\)"$/\1/')
+  GROUP_FREQ=$(busctl get-property $WPAS "$grp" $WPAS.Group Frequency 2>/dev/null | awk '{print $2}' || true)
+  [ -n "$SSID" ] && [ -n "$PASS" ]
+}
+start_p2p || { echo "quickshare-fastlink: Wi-Fi Direct failed" >&2; exit 1; }
+LINK_FREQ=${GROUP_FREQ:-$GO_FREQ}
+
+ip addr add "$NET.1/24" dev "$IF"
+ip link set "$IF" up
+fw_allow "$IF"
+dnsmasq --keep-in-foreground --conf-file=/dev/null --port=0 \
+  --interface="$IF" --bind-interfaces --except-interface=lo \
+  --dhcp-range="$NET.10,$NET.99,255.255.255.0,1h" \
+  --dhcp-leasefile="$DIR/leases" &
+DNSMASQ=$!
+
+umask 027
+printf 'mode=p2p\nssid=%s\npassword=%s\nfrequency=%s\ngateway=%s\n' "$SSID" "$PASS" "$LINK_FREQ" "$NET.1" \
+  > "$DIR/credentials.tmp"
+chgrp "$GROUP" "$DIR/credentials.tmp" "$DIR"
+chmod 0750 "$DIR"
+mv "$DIR/credentials.tmp" "$DIR/credentials"
+echo "quickshare-fastlink: p2p $SSID on $IF ($LINK_FREQ MHz), $STA paused"
+
+wait "$DNSMASQ"

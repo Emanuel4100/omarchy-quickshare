@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# Quick Share for Omarchy: a thin wrapper around quickshare-direct, which speaks
+# Google/Samsung Quick Share over Bluetooth (+ Wi-Fi Direct when it can), so the
+# phone and PC don't need to share a Wi-Fi network.
+#
+#   quickshare status              JSON: installed, receiving, fast
+#   quickshare receive on|off|toggle
+#   quickshare send [file...]      send to a device in receive mode; no args opens a picker
+#   quickshare downloads           open the folder received files go to
+#   quickshare fast on|off         Wi-Fi Direct for transfers (pauses this PC's Wi-Fi meanwhile)
+#   quickshare menu                everything above in an Omarchy menu (the bar's right click)
+set -uo pipefail
+
+here=$(dirname "$(readlink -f "$0")")
+unit=quickshare-direct.service
+fast_helper=/usr/local/lib/omarchy-quickshare/quickshare-fastlink
+fast_dropin=/etc/systemd/system/quickshare-ap@.service.d/50-omarchy-fastlink.conf
+
+# Our notify-send shim turns Accept/Decline (and the "several devices" question)
+# into an Omarchy menu; see bin/notify-send.
+export PATH="$here/bin:${OMARCHY_PATH:-/usr/share/omarchy}/bin:$PATH"
+
+die() { echo "quickshare: $*" >&2; exit 1; }
+notify() { /usr/bin/notify-send --app-name="Quick Share" --icon="$here/assets/quickshare.svg" "$@"; }
+
+installed() { command -v quickshare-direct >/dev/null 2>&1; }
+receiving() { systemctl --user is-active --quiet "$unit"; }
+fast() { [[ -e $fast_dropin ]]; }
+
+status() {
+  local inst=false recv=false fst=false
+  installed && inst=true
+  receiving && recv=true
+  fast && fst=true
+  printf '{"installed":%s,"receiving":%s,"fast":%s}\n' "$inst" "$recv" "$fst"
+}
+
+# enable/disable too, so the choice survives a re-login.
+set_receive() {
+  installed || die "quickshare-direct is not installed"
+  local want=${1:-toggle}
+  if [[ $want == toggle ]]; then
+    if receiving; then want=off; else want=on; fi
+  fi
+  case $want in
+    on) systemctl --user enable --now "$unit" ;;
+    off) systemctl --user disable --now "$unit" ;;
+    *) die "receive takes on, off or toggle" ;;
+  esac
+}
+
+# quickshare-direct's own Wi-Fi Direct link dies at once under NetworkManager, so
+# transfers stay on Bluetooth (~7 KB/s). "fast on" swaps in system/quickshare-fastlink,
+# which takes the Wi-Fi away from NetworkManager for the transfer. It runs as root,
+# so it's copied to /usr/local (root-owned), never run from this user-writable folder.
+set_fast() {
+  installed || die "quickshare-direct is not installed"
+  case ${1:-} in
+    on)
+      pkexec /bin/sh -c 'install -Dm755 "$1" "$3" && install -Dm644 "$2" "$4" && systemctl daemon-reload' sh \
+        "$here/system/quickshare-fastlink" "$here/system/quickshare-ap@.service.d/50-omarchy-fastlink.conf" \
+        "$fast_helper" "$fast_dropin" || die "not installed"
+      echo "Wi-Fi Direct on: this PC's Wi-Fi pauses during transfers" ;;
+    off)
+      pkexec /bin/sh -c 'rm -f "$1" "$2" && rmdir --ignore-fail-on-non-empty "${2%/*}" "${1%/*}"; systemctl daemon-reload' sh \
+        "$fast_helper" "$fast_dropin" || die "not removed"
+      echo "Wi-Fi Direct off: transfers use Bluetooth" ;;
+    *) fast && echo on || echo off ;;
+  esac
+}
+
+send() {
+  installed || die "quickshare-direct is not installed"
+  local files=() f out to=""
+  if (( $# == 0 )); then
+    f=$(bash "$here/scripts/pick_file.sh") || exit 0
+    [[ -n $f ]] || exit 0
+    files=("$f")
+  else
+    for f in "$@"; do
+      [[ -e $f ]] || die "no such file: $f"
+      files+=("$(readlink -f "$f")")
+    done
+  fi
+
+  notify "Quick Share" "Looking for a device in receive mode for ${files[0]##*/}…"
+  out=$(quickshare-direct send "${files[@]}" 2>&1)
+  local code=$?
+
+  # Several devices in receive mode: ask which one, then send again with --to.
+  if (( code != 0 )) && [[ $out == *"pick one with --to NAME:"* ]]; then
+    local names
+    names=$(sed -n 's/.*pick one with --to NAME: *//p' <<< "$out" | tr ',' '\n' | sed 's/^ *//; s/ *$//' | grep .)
+    to=$(omarchy-menu-select "Send ${files[0]##*/} to" -- --width 500 <<< "$names") || exit 0
+    out=$(quickshare-direct send --to "$to" "${files[@]}" 2>&1)
+    code=$?
+  fi
+
+  if (( code != 0 )); then
+    notify "Quick Share: nothing sent" "$(tail -n 1 <<< "$out")"
+    exit "$code"
+  fi
+}
+
+downloads_dir() { xdg-user-dir DOWNLOAD 2>/dev/null || echo "$HOME/Downloads"; }
+
+latest_screenshot() {
+  local dir=${OMARCHY_SCREENSHOT_DIR:-$(xdg-user-dir PICTURES 2>/dev/null || echo "$HOME/Pictures")}
+  find "$dir" -maxdepth 1 -type f -iname '*.png' -printf '%T@\t%p\n' 2>/dev/null | sort -rn | head -1 | cut -f2-
+}
+
+# Rows are "<glyph><TAB><label>"; omarchy-menu-select returns the label.
+menu() {
+  installed || die "quickshare-direct is not installed"
+  local rows=() shot choice
+  if receiving; then rows+=($'\U000f1514\tStop receiving'); else rows+=($'\U000f0497\tStart receiving'); fi
+  if fast; then rows+=($'\U000f140b\tFast Wi-Fi: on (turn off)'); else rows+=($'\U000f140b\tFast Wi-Fi: off (turn on)'); fi
+  rows+=($'\U000f0552\tSend a file…')
+  shot=$(latest_screenshot)
+  [[ -n $shot ]] && rows+=($'\U000f0e51\tSend latest screenshot')
+  rows+=($'\U000f01da\tOpen Downloads')
+  choice=$(printf '%s\n' "${rows[@]}" | omarchy-menu-select "Quick Share" -- --width 400) || exit 0
+  case $choice in
+    "Stop receiving") set_receive off ;;
+    "Start receiving") set_receive on ;;
+    "Fast Wi-Fi: on"*) set_fast off ;;
+    "Fast Wi-Fi: off"*) set_fast on ;;
+    "Send a file…") send ;;
+    "Send latest screenshot") send "$shot" ;;
+    "Open Downloads") xdg-open "$(downloads_dir)" >/dev/null 2>&1 & ;;
+  esac
+}
+
+case ${1:-status} in
+  status) status ;;
+  receive) set_receive "${2:-toggle}" ;;
+  send) shift; send "$@" ;;
+  fast) set_fast "${2:-}" ;;
+  downloads) xdg-open "$(downloads_dir)" >/dev/null 2>&1 & ;;
+  menu) menu ;;
+  *) sed -n '6,11p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

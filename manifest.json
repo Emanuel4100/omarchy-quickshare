@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "emanuel.quickshare",
+  "name": "Quick Share",
+  "version": "1.0.0",
+  "author": "Emanuel4100",
+  "license": "MIT",
+  "description": "Android/Samsung Quick Share in the bar over Bluetooth: receive files with an Accept menu and send files, powered by quickshare-direct.",
+  "homepage": "https://github.com/Emanuel4100/omarchy-quickshare",
+  "repository": "https://github.com/Emanuel4100/omarchy-quickshare",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Quick Share",
+    "description": "Click to send a file, middle-click to open Downloads, right-click for the menu (receiving, fast Wi-Fi, send screenshot). Shows whether a file is coming in or going out.",
+    "category": "Connectivity",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
