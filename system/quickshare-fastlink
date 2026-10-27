@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-only
+# Derived from quickshare-direct's quickshare-ap (GPL-3.0); see LICENSE-GPL-3.0.
 # quickshare-fastlink: Wi-Fi Direct link for Quick Share transfers that NetworkManager can't break.
 # Runs as root in place of quickshare-direct's /usr/lib/quickshare-direct/quickshare-ap (installed
 # by `quickshare fast on` as a drop-in for quickshare-ap@.service); derived from that helper (0.1.5).

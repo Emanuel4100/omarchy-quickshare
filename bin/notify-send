@@ -12,19 +12,19 @@ real=/usr/bin/notify-send
 log=${XDG_CACHE_HOME:-$HOME/.cache}/quickshare-direct/notify.log
 mkdir -p "${log%/*}" && { printf '%s' "$(date +%T)"; printf ' %q' "$@"; echo; } >> "$log" 2>/dev/null
 
-# quickshare-direct asks for the themed icon "network-wireless", which many icon
-# themes (Yaru included) don't have, so the popup shows none. Use our own icon.
-icon=$(dirname "$(dirname "$(readlink -f "$0")")")/assets/quickshare.svg
+# quickshare-direct asks for the themed icon "network-wireless", which most icon
+# themes don't have, so the popup shows no icon (Omarchy) or a letter tile (Omapager).
+# install.sh puts our icon in the user's icon theme as "omarchy-quickshare".
+icon=omarchy-quickshare
 args=()
 for ((i = 1; i <= $#; i++)); do
   a=${!i}
   case $a in
-    --icon=*) args+=("--icon=$icon") ;;
-    -i | --icon) args+=("$a" "$icon"); ((i++)) ;;
+    --icon=*) ;;
+    -i | --icon) ((i++)) ;;
     *) args+=("$a") ;;
   esac
 done
-set -- "${args[@]}"
 
 keys=() labels=() positional=() expire=""
 for ((i = 0; i < ${#args[@]}; i++)); do
@@ -43,6 +43,22 @@ for ((i = 0; i < ${#args[@]}; i++)); do
   else keys+=("${#keys[@]}"); labels+=("$spec"); fi
 done
 
+summary=${positional[0]:-Quick Share}
+body=${positional[1]:-}
+
+args=(--icon="$icon" "${args[@]}")
+
+# "Received from …" with body "photo.jpg (1.2 MB)": show the picture itself
+# (Omarchy's popups draw it; Omapager keeps the icon).
+dl=$(xdg-user-dir DOWNLOAD 2>/dev/null || echo "$HOME/Downloads")
+file=$dl/$body; file=${file% (*}
+if [[ $summary == "Received from"* && -f $file ]]; then
+  case ${file,,} in
+    *.jpg | *.jpeg | *.png | *.webp | *.gif) args=(--hint="string:image-path:$file" "${args[@]}") ;;
+  esac
+fi
+set -- "${args[@]}"
+
 (( ${#keys[@]} )) || exec "$real" "$@"
 
 # A single action ("Show in folder") isn't a question: keep it a normal toast,
@@ -56,19 +72,11 @@ if (( ${#keys[@]} == 1 )); then
       *) plain+=("${args[i]}") ;;
     esac
   done
-  # "Received from …" with body "photo.jpg (1.2 MB)": show the picture itself.
-  dl=$(xdg-user-dir DOWNLOAD 2>/dev/null || echo "$HOME/Downloads")
-  file=$dl/${positional[1]:-}; file=${file% (*}
-  case ${file,,} in
-    *.jpg | *.jpeg | *.png | *.webp | *.gif) [[ -f $file ]] && plain=(--hint="string:image-path:$file" "${plain[@]}") ;;
-  esac
   reply=$("$real" --action="default=${labels[0]}" "${plain[@]}") || exit 0
   [[ $reply == default ]] && printf '%s\n' "${keys[0]}"
   exit 0
 fi
 
-summary=${positional[0]:-Quick Share}
-body=${positional[1]:-}
 prompt=$summary${body:+: $body}
 prompt=$(sed -e 's/<[^>]*>//g' <<< "$prompt" | paste -sd ' ')
 
@@ -76,7 +84,16 @@ prompt=$(sed -e 's/<[^>]*>//g' <<< "$prompt" | paste -sd ' ')
 secs=30
 [[ $expire =~ ^[0-9]+$ ]] && (( expire > 0 )) && secs=$(( (expire + 999) / 1000 ))
 
-choice=$(printf '%s\n' "${labels[@]}" | timeout "$secs" omarchy-menu-select "$prompt" -- --width 700) || exit 0
+# Rows are "<glyph><TAB><label>"; omarchy-menu-select returns the label.
+row_glyph() {
+  case ${1,,} in
+    accept*) printf '\U000f012c' ;;                       # check
+    decline* | reject* | cancel*) printf '\U000f0156' ;;  # close
+    *) printf '\U000f0497' ;;                             # share-variant
+  esac
+}
+choice=$(for l in "${labels[@]}"; do printf '%s\t%s\n' "$(row_glyph "$l")" "$l"; done |
+  timeout "$secs" omarchy-menu-select "$prompt" -- --width 900) || exit 0
 for i in "${!labels[@]}"; do
   [[ ${labels[i]} == "$choice" ]] && { printf '%s\n' "${keys[i]}"; exit 0; }
 done

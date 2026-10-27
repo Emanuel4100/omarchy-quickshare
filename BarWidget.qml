@@ -15,6 +15,7 @@ BarWidget {
   moduleName: "emanuel.quickshare"
 
   readonly property string helperPath: String(Qt.resolvedUrl("quickshare")).replace(/^file:\/\//, "")
+  readonly property string installerPath: String(Qt.resolvedUrl("install.sh")).replace(/^file:\/\//, "")
 
   // Nerd Font (Material Design) glyphs, one per state.
   readonly property string glyphOff: String.fromCodePoint(0xf1514)      // share-variant-outline
@@ -52,6 +53,11 @@ BarWidget {
     if (!sendProc.running) sendProc.running = true
   }
 
+  // Not set up yet (added with `omarchy plugin add` only): run install.sh in a terminal.
+  function runInstaller() {
+    Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", root.installerPath])
+  }
+
   function openMenu() {
     if (!menuProc.running) menuProc.running = true
   }
@@ -65,7 +71,7 @@ BarWidget {
   }
 
   function tooltip() {
-    if (!root.installed) return "Quick Share: quickshare-direct not installed"
+    if (!root.installed) return "Quick Share isn't set up yet\nClick to install"
     var head = root.sending ? "Sending…"
       : root.incoming ? "Receiving a file…"
       : root.receiving ? "Quick Share: this PC can receive" : "Quick Share: receiving is off"
@@ -85,8 +91,8 @@ BarWidget {
     active: root.busy
     tooltipText: root.tooltip()
     onPressed: function(buttonCode) {
-      if (!root.installed) return
-      if (buttonCode === Qt.RightButton) root.openMenu()
+      if (!root.installed) root.runInstaller()
+      else if (buttonCode === Qt.RightButton) root.openMenu()
       else if (buttonCode === Qt.MiddleButton) Quickshell.execDetached([root.helperPath, "downloads"])
       else root.send()
     }
@@ -122,5 +128,6 @@ BarWidget {
 
   Timer { id: debounce; interval: 500; onTriggered: root.refresh() }
   Timer { id: logRestart; interval: 5000; onTriggered: logProc.running = true }
-  Timer { interval: 30000; running: true; repeat: true; onTriggered: root.refresh() }
+  // Faster while not set up, so the icon comes alive soon after install.sh finishes.
+  Timer { interval: root.installed ? 30000 : 5000; running: true; repeat: true; onTriggered: root.refresh() }
 }

@@ -9,19 +9,20 @@
 #   quickshare downloads           open the folder received files go to
 #   quickshare fast on|off         Wi-Fi Direct for transfers (pauses this PC's Wi-Fi meanwhile)
 #   quickshare menu                everything above in an Omarchy menu (the bar's right click)
+#   quickshare doctor              check the setup and say how to fix what's missing
 set -uo pipefail
 
 here=$(dirname "$(readlink -f "$0")")
 unit=quickshare-direct.service
 fast_helper=/usr/local/lib/omarchy-quickshare/quickshare-fastlink
 fast_dropin=/etc/systemd/system/quickshare-ap@.service.d/50-omarchy-fastlink.conf
+env_file=$HOME/.config/quickshare-direct/env
 
 # Our notify-send shim turns Accept/Decline (and the "several devices" question)
 # into an Omarchy menu; see bin/notify-send.
 export PATH="$here/bin:${OMARCHY_PATH:-/usr/share/omarchy}/bin:$PATH"
 
 die() { echo "quickshare: $*" >&2; exit 1; }
-notify() { /usr/bin/notify-send --app-name="Quick Share" --icon="$here/assets/quickshare.svg" "$@"; }
 
 installed() { command -v quickshare-direct >/dev/null 2>&1; }
 receiving() { systemctl --user is-active --quiet "$unit"; }
@@ -83,7 +84,7 @@ send() {
     done
   fi
 
-  notify "Quick Share" "Looking for a device in receive mode for ${files[0]##*/}…"
+  # quickshare-direct posts its own "Looking for a phone…" and result notifications.
   out=$(quickshare-direct send "${files[@]}" 2>&1)
   local code=$?
 
@@ -97,9 +98,87 @@ send() {
   fi
 
   if (( code != 0 )); then
-    notify "Quick Share: nothing sent" "$(tail -n 1 <<< "$out")"
+    printf '%s\n' "$out" >&2
     exit "$code"
   fi
+}
+
+# One line per part of the setup: ✓ fine, ! worth knowing, ✗ broken (with the fix). Exits 1 on any ✗.
+doctor() {
+  local g='' y='' r='' n='' bad=0 v cc pid
+  [[ -t 1 ]] && g=$'\e[32m' y=$'\e[33m' r=$'\e[31m' n=$'\e[0m'
+  pass() { printf '  %s✓%s %s\n' "$g" "$n" "$1"; }
+  warn() { printf '  %s!%s %s\n' "$y" "$n" "$1"; }
+  fail() { printf '  %s✗%s %s\n      fix: %s\n' "$r" "$n" "$1" "$2"; bad=1; }
+
+  if installed; then
+    v=$(pacman -Q quickshare-direct 2>/dev/null | awk '{print $2}')
+    pass "quickshare-direct ${v:-installed}"
+  else
+    fail "quickshare-direct isn't installed" "$here/install.sh"
+  fi
+
+  if receiving; then
+    pass "Receiving: phones can pick $(sed -n 's/^QSD_NAME=//p' "$env_file" 2>/dev/null | tail -1 | grep . || uname -n)"
+  else
+    fail "Receiving is off, so phones can't see this PC" "quickshare receive on"
+  fi
+
+  if [[ $(timeout 3 bluetoothctl show 2>/dev/null) == *'Powered: yes'* ]]; then
+    pass "Bluetooth on"
+  else
+    fail "Bluetooth is off or missing" "bluetoothctl power on"
+  fi
+  if installed && ! systemctl is-enabled -q quickshare-bt-connectable.service 2>/dev/null; then
+    fail "Bluetooth isn't kept connectable for phones" "sudo systemctl enable --now quickshare-bt-connectable"
+  fi
+
+  if grep -q "^PATH=$here/bin:" "$env_file" 2>/dev/null; then
+    pid=$(systemctl --user show -p MainPID --value "$unit" 2>/dev/null)
+    if [[ ${pid:-0} != 0 ]] && ! grep -qz "^PATH=$here/bin:" "/proc/$pid/environ" 2>/dev/null; then
+      fail "The receiver started before its prompts were routed" "systemctl --user restart $unit"
+    else
+      pass "Accept/Decline prompts open as an Omarchy menu"
+    fi
+  else
+    fail "Accept/Decline prompts can't be answered (Omarchy popups have no buttons)" "$here/install.sh"
+  fi
+
+  [[ -f $HOME/.local/share/icons/hicolor/scalable/apps/omarchy-quickshare.svg ]] ||
+    warn "Notifications show a letter instead of the Quick Share icon ($here/install.sh installs it)"
+
+  if systemctl is-active -q ufw 2>/dev/null; then
+    if grep -q 'quickshare-direct' /etc/ufw/user.rules 2>/dev/null; then
+      pass "Firewall: ufw allows quickshare-direct"
+    else
+      fail "Firewall: ufw blocks transfers over your Wi-Fi network" "sudo ufw allow quickshare-direct"
+    fi
+  fi
+
+  cc=$(iw reg get 2>/dev/null | awk '/^global/ { g = 1; next } g && /^country/ { sub(":", "", $2); print $2; exit }')
+  if [[ -n $cc && $cc != 00 ]]; then
+    pass "Wi-Fi region: $cc"
+  else
+    warn "Wi-Fi region not set, so direct Wi-Fi stays on 2.4 GHz (sudo iw reg set XX, or $here/install.sh)"
+  fi
+
+  if [[ $(iw phy 2>/dev/null) == *P2P-GO* ]]; then
+    if fast; then pass "Fast Wi-Fi: on (this PC's Wi-Fi pauses during transfers)"
+    else warn "Fast Wi-Fi: off, transfers use Bluetooth (quickshare fast on)"; fi
+  else
+    warn "This Wi-Fi card can't do Wi-Fi Direct, so transfers use Bluetooth"
+  fi
+
+  if omarchy-plugin-list --json 2>/dev/null | jq -e 'any(.[]; .id == "emanuel.quickshare" and .enabled)' >/dev/null; then
+    pass "Bar icon on"
+  else
+    fail "Bar icon off" "omarchy plugin enable emanuel.quickshare"
+  fi
+
+  if [[ $(readlink -f "$HOME/.local/bin/quickshare" 2>/dev/null) != "$here/quickshare" ]]; then
+    warn "The quickshare command isn't in ~/.local/bin ($here/install.sh links it)"
+  fi
+  return "$bad"
 }
 
 downloads_dir() { xdg-user-dir DOWNLOAD 2>/dev/null || echo "$HOME/Downloads"; }
@@ -119,6 +198,7 @@ menu() {
   shot=$(latest_screenshot)
   [[ -n $shot ]] && rows+=($'\U000f0e51\tSend latest screenshot')
   rows+=($'\U000f01da\tOpen Downloads')
+  rows+=($'\U000f04d9\tCheck setup')
   choice=$(printf '%s\n' "${rows[@]}" | omarchy-menu-select "Quick Share" -- --width 400) || exit 0
   case $choice in
     "Stop receiving") set_receive off ;;
@@ -128,6 +208,7 @@ menu() {
     "Send a file…") send ;;
     "Send latest screenshot") send "$shot" ;;
     "Open Downloads") xdg-open "$(downloads_dir)" >/dev/null 2>&1 & ;;
+    "Check setup") omarchy-launch-floating-terminal-with-presentation "$here/quickshare doctor" ;;
   esac
 }
 
@@ -138,5 +219,6 @@ case ${1:-status} in
   fast) set_fast "${2:-}" ;;
   downloads) xdg-open "$(downloads_dir)" >/dev/null 2>&1 & ;;
   menu) menu ;;
-  *) sed -n '6,11p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  doctor) doctor ;;
+  *) sed -n '6,12p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
