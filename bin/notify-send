@@ -6,11 +6,17 @@
 # don't draw action buttons, so the question can't be answered and the transfer
 # times out. Here, a notification that carries actions becomes an Omarchy picker
 # (omarchy-menu-select) instead; everything else goes to the real notify-send.
+#
+# Also: transfers from trusted devices (`quickshare trust`) are accepted without
+# asking, a received file opens on click, and while `quickshare send` runs, its
+# status notifications are copied to $QS_SEND_STATE for the bar.
 set -uo pipefail
 
 real=/usr/bin/notify-send
-log=${XDG_CACHE_HOME:-$HOME/.cache}/quickshare-direct/notify.log
-mkdir -p "${log%/*}" && { printf '%s' "$(date +%T)"; printf ' %q' "$@"; echo; } >> "$log" 2>/dev/null
+cache=${XDG_CACHE_HOME:-$HOME/.cache}/quickshare-direct
+trusted=$HOME/.config/quickshare-direct/trusted
+log=$cache/notify.log
+mkdir -p "$cache" && { printf '%s' "$(date +%T)"; printf ' %q' "$@"; echo; } >> "$log" 2>/dev/null
 
 # quickshare-direct asks for the themed icon "network-wireless", which most icon
 # themes don't have, so the popup shows no icon (Omarchy) or a letter tile (Omapager).
@@ -46,6 +52,12 @@ done
 summary=${positional[0]:-Quick Share}
 body=${positional[1]:-}
 
+# A send in progress: the bar shows quickshare-direct's latest status ("accept on the phone (PIN …)").
+if [[ -n ${QS_SEND_STATE:-} && -f $QS_SEND_STATE ]]; then
+  jq -c --arg t "$summary" --arg d "$body" '.title = $t | .detail = $d' "$QS_SEND_STATE" > "$QS_SEND_STATE.tmp" 2>/dev/null &&
+    mv -f "$QS_SEND_STATE.tmp" "$QS_SEND_STATE"
+fi
+
 args=(--icon="$icon" "${args[@]}")
 
 # "Received from …" with body "photo.jpg (1.2 MB)": show the picture itself
@@ -61,20 +73,48 @@ set -- "${args[@]}"
 
 (( ${#keys[@]} )) || exec "$real" "$@"
 
+# The notification without its actions, for a plain toast.
+plain=()
+for ((i = 0; i < ${#args[@]}; i++)); do
+  case ${args[i]} in
+    --action=*) ;;
+    -A | --action) ((i++)) ;;
+    *) plain+=("${args[i]}") ;;
+  esac
+done
+
+# Open outside the receiver's service, so the app outlives a restart of it.
+open_detached() {
+  { systemd-run --user --scope --quiet --collect xdg-open "$1" || xdg-open "$1"; } >/dev/null 2>&1 &
+}
+
 # A single action ("Show in folder") isn't a question: keep it a normal toast,
 # renamed to "default" so clicking it (the only thing Omarchy popups do) runs it.
+# One received file opens itself on click instead of its folder.
 if (( ${#keys[@]} == 1 )); then
-  plain=()
-  for ((i = 0; i < ${#args[@]}; i++)); do
-    case ${args[i]} in
-      --action=*) ;;
-      -A | --action) ((i++)) ;;
-      *) plain+=("${args[i]}") ;;
-    esac
-  done
-  reply=$("$real" --action="default=${labels[0]}" "${plain[@]}") || exit 0
-  [[ $reply == default ]] && printf '%s\n' "${keys[0]}"
+  label=${labels[0]} open_file=
+  if [[ $summary == "Received from"* && -f $file ]]; then open_file=$file label=Open; fi
+  reply=$("$real" --action="default=$label" "${plain[@]}") || exit 0
+  if [[ $reply == default ]]; then
+    if [[ -n $open_file ]]; then open_detached "$open_file"; else printf '%s\n' "${keys[0]}"; fi
+  fi
   exit 0
+fi
+
+accept=
+for i in "${!keys[@]}"; do [[ ${keys[i]} == accept ]] && accept=accept; done
+
+# "Quick Share from NAME · PIN 1234": remember who asked (the menu offers to trust them), and
+# answer at once for a trusted device.
+if [[ -n $accept && $summary == "Quick Share from "* ]]; then
+  sender=${summary#Quick Share from }
+  sender=${sender% · PIN *}
+  printf '%s\n' "$sender" > "$cache/last-sender"
+  if grep -qxF "$sender" "$trusted" 2>/dev/null; then
+    "$real" --app-name="Quick Share" --icon="$icon" "Accepting from $sender" "$body" &
+    printf '%s\n' "$accept"
+    exit 0
+  fi
 fi
 
 prompt=$summary${body:+: $body}
@@ -92,8 +132,28 @@ row_glyph() {
     *) printf '\U000f0497' ;;                             # share-variant
   esac
 }
-choice=$(for l in "${labels[@]}"; do printf '%s\t%s\n' "$(row_glyph "$l")" "$l"; done |
-  timeout "$secs" omarchy-menu-select "$prompt" -- --width 900) || exit 0
+now_us() { echo "${EPOCHREALTIME//[.,]/}"; }
+ask() {
+  for l in "${labels[@]}"; do printf '%s\t%s\n' "$(row_glyph "$l")" "$l"; done |
+    timeout "$secs" omarchy-menu-select "$prompt" -- --width 900
+}
+
+# A menu that closes within a moment wasn't answered by anyone: another menu took its place or it
+# couldn't open (a transfer was once declined 0.2 s after asking). Ask once more, then fall back
+# to a popup whose click accepts.
+start=$(now_us)
+choice=$(ask)
+if [[ -z $choice ]] && (( $(now_us) - start < 1000000 )); then
+  sleep 0.5
+  start=$(now_us)
+  choice=$(ask)
+  if [[ -z $choice ]] && (( $(now_us) - start < 1000000 )) && [[ -n $accept ]]; then
+    reply=$("$real" --app-name="Quick Share" --icon="$icon" --action="default=Accept" --expire-time=$((secs * 1000)) \
+      "$summary" "Click to accept: $body") || exit 0
+    [[ $reply == default ]] && printf '%s\n' "$accept"
+    exit 0
+  fi
+fi
 for i in "${!labels[@]}"; do
   [[ ${labels[i]} == "$choice" ]] && { printf '%s\n' "${keys[i]}"; exit 0; }
 done

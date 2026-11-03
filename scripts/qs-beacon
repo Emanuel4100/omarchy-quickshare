@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+# qs-beacon [SECONDS]: send Quick Share's "a device nearby is sharing" Bluetooth beacon (service
+# data under 0xFE2C) for SECONDS (default 60), or until stopped with SIGTERM/SIGINT.
+#
+# A phone on its Quick Share receive screen only announces itself (over BLE and mDNS) once it hears
+# this beacon; Samsung phones don't announce themselves without it at all. quickshare-direct's
+# `send` scans for the phone but never sends it, so `quickshare send` runs this alongside.
+# Registered through BlueZ's LEAdvertisingManager1, so no root; BlueZ drops it when we exit.
+import signal
+import sys
+
+import dbus
+import dbus.mainloop.glib
+import dbus.service
+from gi.repository import GLib
+
+try:  # GLib >= 2.80 moved the Unix signal source; older PyGObject only has the GLib one.
+    from gi.repository import GLibUnix
+    signal_add = GLibUnix.signal_add
+except ImportError:
+    signal_add = GLib.unix_signal_add
+
+BLUEZ = "org.bluez"
+AD_IFACE = "org.bluez.LEAdvertisement1"
+AD_PATH = "/org/omarchy/quickshare/beacon"
+SHARING_UUID = "0000fe2c-0000-1000-8000-00805f9b34fb"
+# Quick Share's model id (fc 12 8e), then a fixed body that carries no identity: the same bytes as
+# quickshare-direct's BleAdvertiser (core_lib/src/hdl/blea.rs) and rQuickShare.
+SERVICE_DATA = bytes([0xFC, 0x12, 0x8E, 0x01, 0x42, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                      0xBF, 0x2D, 0x5B, 0xA0, 0xE1, 0xD8, 0x75, 0x24, 0xCA, 0x00])
+
+
+class Beacon(dbus.service.Object):
+    def __init__(self, bus):
+        super().__init__(bus, AD_PATH)
+
+    @dbus.service.method(dbus.PROPERTIES_IFACE, in_signature="s", out_signature="a{sv}")
+    def GetAll(self, interface):
+        if interface != AD_IFACE:
+            raise dbus.exceptions.DBusException("org.freedesktop.DBus.Error.InvalidArgs")
+        return {
+            "Type": "broadcast",
+            "ServiceData": dbus.Dictionary(
+                {SHARING_UUID: dbus.Array(SERVICE_DATA, signature="y")}, signature="sv"),
+        }
+
+    @dbus.service.method(AD_IFACE)
+    def Release(self):
+        pass
+
+
+def adapter_path(bus):
+    objects = dbus.Interface(bus.get_object(BLUEZ, "/"), "org.freedesktop.DBus.ObjectManager").GetManagedObjects()
+    for path, ifaces in objects.items():
+        if "org.bluez.LEAdvertisingManager1" in ifaces and ifaces.get("org.bluez.Adapter1", {}).get("Powered"):
+            return path
+    return None
+
+
+def main():
+    seconds = int(sys.argv[1]) if len(sys.argv) > 1 else 60
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+    path = adapter_path(bus)
+    if path is None:
+        print("qs-beacon: no powered Bluetooth adapter", file=sys.stderr)
+        return 1
+    manager = dbus.Interface(bus.get_object(BLUEZ, path), "org.bluez.LEAdvertisingManager1")
+    Beacon(bus)
+    loop = GLib.MainLoop()
+    failed = []
+
+    def registered():
+        pass
+
+    def register_failed(error):
+        print(f"qs-beacon: {error.get_dbus_message() or error}", file=sys.stderr)
+        failed.append(error)
+        loop.quit()
+
+    manager.RegisterAdvertisement(AD_PATH, {}, reply_handler=registered, error_handler=register_failed)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal_add(GLib.PRIORITY_DEFAULT, sig, loop.quit)
+    GLib.timeout_add_seconds(seconds, loop.quit)
+    loop.run()
+    if failed:
+        return 1
+    try:
+        manager.UnregisterAdvertisement(AD_PATH)
+    except dbus.exceptions.DBusException:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
