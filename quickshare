@@ -3,11 +3,14 @@
 # Google/Samsung Quick Share over Bluetooth (+ Wi-Fi Direct when it can), so the
 # phone and PC don't need to share a Wi-Fi network.
 #
-#   quickshare status              JSON: installed, receiving, fast
+#   quickshare status              JSON: installed, receiving, fast, sending
 #   quickshare receive on|off|toggle
 #   quickshare send [file...]      send to a device in receive mode; no args opens a picker
+#   quickshare cancel              stop the send in progress
+#   quickshare devices             list phones in receive mode nearby
 #   quickshare downloads           open the folder received files go to
 #   quickshare fast on|off         Wi-Fi Direct for transfers (pauses this PC's Wi-Fi meanwhile)
+#   quickshare trust [add|remove NAME]  devices whose files are accepted without asking
 #   quickshare menu                everything above in an Omarchy menu (the bar's right click)
 #   quickshare doctor              check the setup and say how to fix what's missing
 set -uo pipefail
@@ -17,6 +20,12 @@ unit=quickshare-direct.service
 fast_helper=/usr/local/lib/omarchy-quickshare/quickshare-fastlink
 fast_dropin=/etc/systemd/system/quickshare-ap@.service.d/50-omarchy-fastlink.conf
 env_file=$HOME/.config/quickshare-direct/env
+trusted_file=$HOME/.config/quickshare-direct/trusted
+cache_dir=${XDG_CACHE_HOME:-$HOME/.cache}/quickshare-direct
+state_dir=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/quickshare
+# The send in progress, for the bar: {pid, title, detail, result, at}. Our notify-send shim
+# keeps title/detail up to date from quickshare-direct's own status notifications.
+send_state=$state_dir/send.json
 
 # Our notify-send shim turns Accept/Decline (and the "several devices" question)
 # into an Omarchy menu; see bin/notify-send.
@@ -27,13 +36,28 @@ die() { echo "quickshare: $*" >&2; exit 1; }
 installed() { command -v quickshare-direct >/dev/null 2>&1; }
 receiving() { systemctl --user is-active --quiet "$unit"; }
 fast() { [[ -e $fast_dropin ]]; }
+send_pid() { jq -r '.pid // 0' "$send_state" 2>/dev/null || echo 0; }
+sending() { local p; p=$(send_pid); [[ $p != 0 ]] && kill -0 "$p" 2>/dev/null; }
 
 status() {
-  local inst=false recv=false fst=false
+  local inst=false recv=false fst=false snd=false
   installed && inst=true
   receiving && recv=true
   fast && fst=true
-  printf '{"installed":%s,"receiving":%s,"fast":%s}\n' "$inst" "$recv" "$fst"
+  sending && snd=true
+  # The bar watches the state file, which has to exist for that; a send that died without
+  # clearing it (SIGKILL) is cleared here.
+  if [[ ! -e $send_state ]] || { [[ $snd == false && $(send_pid) != 0 ]]; }; then
+    set_send_state 0 "" "" ""
+  fi
+  printf '{"installed":%s,"receiving":%s,"fast":%s,"sending":%s}\n' "$inst" "$recv" "$fst" "$snd"
+}
+
+set_send_state() {
+  mkdir -p "$state_dir"
+  jq -nc --argjson pid "$1" --arg title "$2" --arg detail "$3" --arg result "$4" --argjson at "$(date +%s)" \
+    '{pid: $pid, title: $title, detail: $detail, result: $result, at: $at}' > "$send_state.tmp" &&
+    mv -f "$send_state.tmp" "$send_state"
 }
 
 # enable/disable too, so the choice survives a re-login.
@@ -70,9 +94,47 @@ set_fast() {
   esac
 }
 
+# Phones on their receive screen only announce themselves after hearing a "device nearby is
+# sharing" beacon (Samsung not at all without it), which quickshare-direct doesn't send; see
+# scripts/qs-beacon. Optional: without python-dbus/python-gobject sending works as before.
+beacon_pid=
+beacon_on() {
+  python3 -I -c 'import dbus, gi' 2>/dev/null || return 0
+  python3 -I "$here/scripts/qs-beacon" "${1:-120}" >/dev/null 2>&1 &
+  beacon_pid=$!
+}
+beacon_off() {
+  [[ -n $beacon_pid ]] && kill "$beacon_pid" 2>/dev/null
+  beacon_pid=
+  return 0
+}
+
+# Run quickshare-direct in the background so `quickshare cancel` (SIGINT) reaches it: its own
+# ctrl-c handling cancels the transfer and leaves the phone's network. --default-signal undoes
+# the ignored SIGINT a non-interactive shell gives background jobs (during the scan, before
+# quickshare-direct handles it, SIGINT simply ends it).
+child=
+run_direct() {
+  env --default-signal=INT quickshare-direct "$@" > "$state_dir/send.out" 2>&1 &
+  child=$!
+  local code
+  while :; do
+    wait "$child"; code=$?
+    kill -0 "$child" 2>/dev/null || break
+  done
+  child=
+  return "$code"
+}
+forward_cancel() {
+  [[ -n $child ]] || return 0
+  kill -INT "$child" 2>/dev/null
+  # Still running 5 s later: it didn't take the hint.
+  (sleep 5; kill -TERM "$child" 2>/dev/null) &
+}
+
 send() {
   installed || die "quickshare-direct is not installed"
-  local files=() f out to=""
+  local files=() f to="" code names last title
   if (( $# == 0 )); then
     f=$(bash "$here/scripts/pick_file.sh") || exit 0
     [[ -n $f ]] || exit 0
@@ -80,32 +142,124 @@ send() {
   else
     for f in "$@"; do
       [[ -e $f ]] || die "no such file: $f"
+      if [[ ! -f $f ]]; then
+        notify-send --app-name="Quick Share" "Quick Share: nothing sent" "${f##*/} is a folder; Quick Share sends files only."
+        die "not a file: $f"
+      fi
       files+=("$(readlink -f "$f")")
     done
   fi
 
+  mkdir -p "$state_dir" "$cache_dir"
+  export QS_SEND_STATE=$send_state
+  set_send_state $$ "Quick Share" "Looking for a phone…" ""
+  trap 'forward_cancel' INT TERM
+  trap 'beacon_off' EXIT
+  beacon_on 120
+
   # quickshare-direct posts its own "Looking for a phone…" and result notifications.
-  out=$(quickshare-direct send "${files[@]}" 2>&1)
+  run_direct send "${files[@]}"
+  code=$?
+
+  # Several devices in receive mode: ask which one (the last one we sent to first), then send
+  # again with --to. The names come in that notification, which the shim saved.
+  if (( code == 2 )); then
+    names=$(jq -r '.detail' "$send_state" 2>/dev/null | sed -n 's/.*pick one with --to NAME: *//p' |
+      tr ',' '\n' | sed 's/^ *//; s/ *$//' | grep .)
+    last=$(cat "$cache_dir/last-target" 2>/dev/null)
+    if [[ -n $last ]] && grep -qxF "$last" <<< "$names"; then
+      names=$(printf '%s\n' "$last"; grep -vxF "$last" <<< "$names")
+    fi
+    if [[ -n $names ]] && to=$(omarchy-menu-select "Send ${files[0]##*/} to" -- --width 500 <<< "$names"); then
+      set_send_state $$ "Quick Share" "Connecting to $to…" ""
+      run_direct send --to "$to" "${files[@]}"
+      code=$?
+    else
+      code=130
+    fi
+  fi
+
+  title=$(jq -r '.title' "$send_state" 2>/dev/null)
+  case $code in
+    0)
+      [[ $title == Sent\ *\ to\ * ]] && printf '%s\n' "${title##* to }" > "$cache_dir/last-target"
+      set_send_state 0 "$title" "" sent ;;
+    130)
+      # Cancelled while still looking, quickshare-direct had no time to say so.
+      [[ $title == "Quick Share: cancelled" ]] || notify-send --app-name="Quick Share" "Quick Share: cancelled" "${files[0]##*/}"
+      set_send_state 0 "Quick Share: cancelled" "" cancelled ;;
+    *) set_send_state 0 "$title" "$(jq -r '.detail' "$send_state" 2>/dev/null)" failed ;;
+  esac
+  if (( code != 0 && code != 130 )); then
+    cat "$state_dir/send.out" >&2
+  fi
+  exit "$code"
+}
+
+cancel() {
+  local p
+  p=$(send_pid)
+  if [[ $p == 0 ]] || ! kill -0 "$p" 2>/dev/null; then die "nothing is being sent"; fi
+  kill -INT "$p"
+}
+
+devices() {
+  installed || die "quickshare-direct is not installed"
+  trap 'beacon_off' EXIT
+  beacon_on 30
+  quickshare-direct devices
   local code=$?
+  # Phones also announce themselves on the Wi-Fi network (mDNS). quickshare-direct only sends over
+  # Bluetooth, but a phone listed here and not above narrows down why sending finds nothing.
+  command -v avahi-browse >/dev/null || return "$code"
+  echo "On this Wi-Fi network:"
+  timeout 5 avahi-browse -rpt _FC9F5ED42C8A._tcp 2>/dev/null | python3 -I -c '
+import base64, sys
+seen = set()
+for line in sys.stdin:
+    f = line.rstrip("\n").split(";")
+    if len(f) < 10 or f[0] != "=" or f[2] != "IPv4" or f[7] in seen:
+        continue
+    seen.add(f[7])
+    n = next((t[2:] for t in f[9].replace("\"", "").split(" ") if t.startswith("n=")), "")
+    try:
+        b = base64.urlsafe_b64decode(n + "=" * (-len(n) % 4))
+    except ValueError:
+        continue
+    kind = {1: "phone", 2: "tablet", 3: "computer"}.get((b[0] >> 1) & 7, "device")
+    if len(b) > 17 and b[17]:
+        name = b[18:18 + b[17]].decode(errors="replace")
+        print(f"  {name} ({kind}, {f[7]})")
+    else:
+        print(f"  a {kind} visible only to its own contacts ({f[7]})")
+' || echo "  (none)"
+  return "$code"
+}
 
-  # Several devices in receive mode: ask which one, then send again with --to.
-  if (( code != 0 )) && [[ $out == *"pick one with --to NAME:"* ]]; then
-    local names
-    names=$(sed -n 's/.*pick one with --to NAME: *//p' <<< "$out" | tr ',' '\n' | sed 's/^ *//; s/ *$//' | grep .)
-    to=$(omarchy-menu-select "Send ${files[0]##*/} to" -- --width 500 <<< "$names") || exit 0
-    out=$(quickshare-direct send --to "$to" "${files[@]}" 2>&1)
-    code=$?
-  fi
-
-  if (( code != 0 )); then
-    printf '%s\n' "$out" >&2
-    exit "$code"
-  fi
+# Senders whose transfers bin/notify-send accepts without asking, one device name per line (as the
+# phone calls itself, e.g. "Emanuel's Tab S9+"). Names aren't verified: anyone nearby can call
+# their phone the same.
+trust() {
+  local name=${2:-}
+  case ${1:-list} in
+    list) [[ -s $trusted_file ]] && cat "$trusted_file"; return 0 ;;
+    add)
+      [[ -n $name ]] || die "trust add takes a device name"
+      mkdir -p "${trusted_file%/*}"
+      grep -qxF "$name" "$trusted_file" 2>/dev/null || printf '%s\n' "$name" >> "$trusted_file"
+      echo "Files from $name are now accepted without asking" ;;
+    remove)
+      [[ -n $name ]] || die "trust remove takes a device name"
+      [[ -f $trusted_file ]] && grep -vxF "$name" "$trusted_file" > "$trusted_file.tmp"
+      mv -f "$trusted_file.tmp" "$trusted_file" 2>/dev/null
+      echo "Files from $name need an Accept again" ;;
+    *) die "trust takes list, add NAME or remove NAME" ;;
+  esac
 }
 
 # One line per part of the setup: ✓ fine, ! worth knowing, ✗ broken (with the fix). Exits 1 on any ✗.
 doctor() {
-  local g='' y='' r='' n='' bad=0 v cc pid
+  local g='' y='' r='' n='' bad=0 v cc pid sta phy
   [[ -t 1 ]] && g=$'\e[32m' y=$'\e[33m' r=$'\e[31m' n=$'\e[0m'
   pass() { printf '  %s✓%s %s\n' "$g" "$n" "$1"; }
   warn() { printf '  %s!%s %s\n' "$y" "$n" "$1"; }
@@ -132,6 +286,11 @@ doctor() {
   if installed && ! systemctl is-enabled -q quickshare-bt-connectable.service 2>/dev/null; then
     fail "Bluetooth isn't kept connectable for phones" "sudo systemctl enable --now quickshare-bt-connectable"
   fi
+  if python3 -I -c 'import dbus, gi' 2>/dev/null; then
+    pass "Sending wakes up phones on their receive screen"
+  else
+    warn "Sending can't wake up phones, so Samsung phones aren't found (sudo pacman -S python-dbus python-gobject)"
+  fi
 
   if grep -q "^PATH=$here/bin:" "$env_file" 2>/dev/null; then
     pid=$(systemctl --user show -p MainPID --value "$unit" 2>/dev/null)
@@ -143,6 +302,7 @@ doctor() {
   else
     fail "Accept/Decline prompts can't be answered (Omarchy popups have no buttons)" "$here/install.sh"
   fi
+  [[ -s $trusted_file ]] && pass "Accepted without asking: $(paste -sd ',' "$trusted_file" | sed 's/,/, /g')"
 
   [[ -f $HOME/.local/share/icons/hicolor/scalable/apps/omarchy-quickshare.svg ]] ||
     warn "Notifications show a letter instead of the Quick Share icon ($here/install.sh installs it)"
@@ -155,15 +315,28 @@ doctor() {
     fi
   fi
 
-  cc=$(iw reg get 2>/dev/null | awk '/^global/ { g = 1; next } g && /^country/ { sub(":", "", $2); print $2; exit }')
-  if [[ -n $cc && $cc != 00 ]]; then
-    pass "Wi-Fi region: $cc"
+  # Intel cards keep their own region ("phy#0 (self-managed)"), learned from nearby networks; the
+  # global one doesn't apply to them.
+  sta=$(iw dev 2>/dev/null | awk '/Interface/{i=$2} /type managed/{print i; exit}')
+  phy=$(cat "/sys/class/net/$sta/phy80211/name" 2>/dev/null)
+  cc=$(iw reg get 2>/dev/null | awk -v want="phy#${phy#phy}" '
+    $1 == want && /self-managed/ { s = 1; next } /^(global|phy#)/ { s = 0 }
+    s && /^country/ { sub(":", "", $2); print $2; exit }')
+  if [[ -n $cc ]]; then
+    pass "Wi-Fi region: $cc (set by the Wi-Fi card)"
   else
-    warn "Wi-Fi region not set, so direct Wi-Fi stays on 2.4 GHz (sudo iw reg set XX, or $here/install.sh)"
+    cc=$(iw reg get 2>/dev/null | awk '/^global/ { g = 1; next } g && /^country/ { sub(":", "", $2); print $2; exit }')
+    if [[ -n $cc && $cc != 00 ]]; then
+      pass "Wi-Fi region: $cc"
+    else
+      warn "Wi-Fi region not set, so direct Wi-Fi stays on 2.4 GHz (sudo iw reg set XX, or $here/install.sh)"
+    fi
   fi
 
   if [[ $(iw phy 2>/dev/null) == *P2P-GO* ]]; then
-    if fast; then pass "Fast Wi-Fi: on (this PC's Wi-Fi pauses during transfers)"
+    if fast && ! cmp -s "$here/system/quickshare-fastlink" "$fast_helper"; then
+      fail "Fast Wi-Fi: its helper doesn't match this version of the plugin" "quickshare fast on"
+    elif fast; then pass "Fast Wi-Fi: on (this PC's Wi-Fi pauses during transfers)"
     else warn "Fast Wi-Fi: off, transfers use Bluetooth (quickshare fast on)"; fi
   else
     warn "This Wi-Fi card can't do Wi-Fi Direct, so transfers use Bluetooth"
@@ -188,19 +361,44 @@ latest_screenshot() {
   find "$dir" -maxdepth 1 -type f -iname '*.png' -printf '%T@\t%p\n' 2>/dev/null | sort -rn | head -1 | cut -f2-
 }
 
+# Add the last sender that asked, or remove a trusted one.
+trust_menu() {
+  local rows=() last choice name
+  last=$(cat "$cache_dir/last-sender" 2>/dev/null)
+  if [[ -n $last ]] && ! grep -qxF "$last" "$trusted_file" 2>/dev/null; then
+    rows+=($'\U000f012c\t'"Always accept from $last")
+  fi
+  while IFS= read -r name; do
+    [[ -n $name ]] && rows+=($'\U000f0156\t'"Ask again for $name")
+  done < <(cat "$trusted_file" 2>/dev/null)
+  if (( ${#rows[@]} == 0 )); then
+    notify-send --app-name="Quick Share" "Quick Share: no devices to trust yet" \
+      "Receive a file from your phone first, then it can be accepted without asking."
+    return
+  fi
+  choice=$(printf '%s\n' "${rows[@]}" | omarchy-menu-select "Accept without asking" -- --width 500) || return 0
+  case $choice in
+    "Always accept from "*) trust add "${choice#Always accept from }" >/dev/null ;;
+    "Ask again for "*) trust remove "${choice#Ask again for }" >/dev/null ;;
+  esac
+}
+
 # Rows are "<glyph><TAB><label>"; omarchy-menu-select returns the label.
 menu() {
   installed || die "quickshare-direct is not installed"
   local rows=() shot choice
+  if sending; then rows+=($'\U000f0156\tCancel sending'); fi
   if receiving; then rows+=($'\U000f1514\tStop receiving'); else rows+=($'\U000f0497\tStart receiving'); fi
   if fast; then rows+=($'\U000f140b\tFast Wi-Fi: on (turn off)'); else rows+=($'\U000f140b\tFast Wi-Fi: off (turn on)'); fi
   rows+=($'\U000f0552\tSend a file…')
   shot=$(latest_screenshot)
   [[ -n $shot ]] && rows+=($'\U000f0e51\tSend latest screenshot')
   rows+=($'\U000f01da\tOpen Downloads')
+  rows+=($'\U000f0565\tTrusted devices…')
   rows+=($'\U000f04d9\tCheck setup')
   choice=$(printf '%s\n' "${rows[@]}" | omarchy-menu-select "Quick Share" -- --width 400) || exit 0
   case $choice in
+    "Cancel sending") cancel ;;
     "Stop receiving") set_receive off ;;
     "Start receiving") set_receive on ;;
     "Fast Wi-Fi: on"*) set_fast off ;;
@@ -208,6 +406,7 @@ menu() {
     "Send a file…") send ;;
     "Send latest screenshot") send "$shot" ;;
     "Open Downloads") xdg-open "$(downloads_dir)" >/dev/null 2>&1 & ;;
+    "Trusted devices…") trust_menu ;;
     "Check setup") omarchy-launch-floating-terminal-with-presentation "$here/quickshare doctor" ;;
   esac
 }
@@ -216,9 +415,12 @@ case ${1:-status} in
   status) status ;;
   receive) set_receive "${2:-toggle}" ;;
   send) shift; send "$@" ;;
+  cancel) cancel ;;
+  devices) devices ;;
   fast) set_fast "${2:-}" ;;
+  trust) shift; trust "$@" ;;
   downloads) xdg-open "$(downloads_dir)" >/dev/null 2>&1 & ;;
   menu) menu ;;
   doctor) doctor ;;
-  *) sed -n '6,12p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '6,15p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

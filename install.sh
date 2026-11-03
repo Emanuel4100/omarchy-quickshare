@@ -7,8 +7,8 @@
 # Adds the plugin (when run through curl), installs quickshare-direct from its latest release
 # (checksum-verified), opens its ports in ufw/firewalld, sets the Wi-Fi region if none is set,
 # routes the receiver's Accept/Decline prompts through bin/notify-send, links the `quickshare`
-# CLI into ~/.local/bin, starts receiving and puts the icon on the bar. Run it again any time:
-# steps that are already done are skipped.
+# CLI into ~/.local/bin, adds "Send to phone" to Nautilus, starts receiving and puts the icon on
+# the bar. Run it again any time: steps that are already done are skipped.
 #
 # Environment: QS_REPO (plugin git URL), QS_YES=1 (ask nothing: skip the Wi-Fi region and fast mode)
 set -euo pipefail
@@ -21,6 +21,9 @@ OMARCHY_BIN=${OMARCHY_PATH:-/usr/share/omarchy}/bin
 ENV_FILE=$HOME/.config/quickshare-direct/env
 CLI_LINK=$HOME/.local/bin/quickshare
 ICON_FILE=$HOME/.local/share/icons/hicolor/scalable/apps/omarchy-quickshare.svg
+NAUTILUS_SCRIPT="$HOME/.local/share/nautilus/scripts/Send to phone (Quick Share)"
+FAST_HELPER=/usr/local/lib/omarchy-quickshare/quickshare-fastlink
+FAST_DROPIN=/etc/systemd/system/quickshare-ap@.service.d/50-omarchy-fastlink.conf
 REGDOM_FILE=/etc/conf.d/wireless-regdom
 UNIT=quickshare-direct.service
 export PATH="$OMARCHY_BIN:$HOME/.local/bin:$PATH"
@@ -149,6 +152,13 @@ timezone_country() {
 set_wifi_region() {
   step "Wi-Fi region"
   local cc
+  # Intel cards keep their own region ("phy#0 (self-managed)"); the global one doesn't apply to them.
+  cc=$(iw reg get 2>/dev/null | awk '/^phy#/ && /self-managed/ { s = 1; next } /^(global|phy#)/ { s = 0 }
+    s && /^country/ { sub(":", "", $2); print $2; exit }') || true
+  if [[ -n $cc ]]; then
+    ok "$cc, set by the Wi-Fi card"
+    return
+  fi
   cc=$(iw reg get 2>/dev/null | awk '/^global/ { g = 1; next } g && /^country/ { sub(":", "", $2); print $2; exit }') || true
   if [[ -n $cc && $cc != 00 ]]; then
     ok "set to $cc"
@@ -216,6 +226,35 @@ link_cli() {
   fi
 }
 
+# Sending wakes up phones on their receive screen with a Bluetooth beacon (scripts/qs-beacon),
+# which needs Python's D-Bus and GLib bindings.
+install_beacon_deps() {
+  step "Waking up phones for sending"
+  if python3 -I -c 'import dbus, gi' 2>/dev/null; then
+    ok "python-dbus and python-gobject installed"
+  else
+    sudo pacman -S --needed --noconfirm python-dbus python-gobject
+    ok "installed python-dbus and python-gobject"
+  fi
+}
+
+# Nautilus: right-click → Scripts → Send to phone (Quick Share), for one or several files.
+add_send_to() {
+  step "Send from the file manager"
+  local want
+  want=$(printf '%s\n' '#!/usr/bin/env bash' \
+    '# Nautilus: right-click → Scripts → Send to phone. Installed by emanuel.quickshare (install.sh).' \
+    "exec $(printf '%q' "$(readlink -f "$PLUGIN_DIR")/quickshare") send \"\$@\"")
+  if [[ -f $NAUTILUS_SCRIPT && $(cat "$NAUTILUS_SCRIPT") == "$want" ]]; then
+    ok "Nautilus: right-click → Scripts → Send to phone (Quick Share)"
+    return
+  fi
+  mkdir -p "${NAUTILUS_SCRIPT%/*}"
+  printf '%s\n' "$want" > "$NAUTILUS_SCRIPT"
+  chmod +x "$NAUTILUS_SCRIPT"
+  ok "added to Nautilus: right-click → Scripts → Send to phone (Quick Share)"
+}
+
 start_receiver() {
   step "Receiving"
   systemctl --user daemon-reload
@@ -241,10 +280,16 @@ add_to_bar() {
   fi
 }
 
+# The helper runs as root from a copy in /usr/local, which a plugin update doesn't touch: refresh it.
 offer_fast_mode() {
   step "Fast Wi-Fi transfers"
-  if [[ -e /etc/systemd/system/quickshare-ap@.service.d/50-omarchy-fastlink.conf ]]; then
-    ok "on"
+  if [[ -e $FAST_DROPIN ]]; then
+    if cmp -s "$PLUGIN_DIR/system/quickshare-fastlink" "$FAST_HELPER"; then
+      ok "on"
+    else
+      echo "  updating its helper (asks for your password)"
+      "$PLUGIN_DIR/quickshare" fast on | sed 's/^/  /'
+    fi
     return
   fi
   if (( FRESH )) && [[ $(iw phy 2>/dev/null) == *P2P-GO* ]] &&
@@ -266,6 +311,8 @@ do_install() {
   set_wifi_region
   route_prompts
   link_cli
+  install_beacon_deps
+  add_send_to
   start_receiver
   add_to_bar
   offer_fast_mode
@@ -278,7 +325,7 @@ do_install() {
 
 uninstall() {
   printf '%sRemoving Quick Share for Omarchy%s\n' "$bold" "$reset"
-  [[ -e /etc/systemd/system/quickshare-ap@.service.d/50-omarchy-fastlink.conf ]] && "$PLUGIN_DIR/quickshare" fast off
+  [[ -e $FAST_DROPIN ]] && "$PLUGIN_DIR/quickshare" fast off
   if systemctl --user cat "$UNIT" >/dev/null 2>&1; then
     systemctl --user disable --now "$UNIT" 2>/dev/null || true
     ok "receiving off"
@@ -288,7 +335,7 @@ uninstall() {
     [[ -s $ENV_FILE ]] || { rm -f "$ENV_FILE"; rmdir --ignore-fail-on-non-empty "${ENV_FILE%/*}"; }
     ok "prompt routing removed from $ENV_FILE"
   fi
-  rm -f "$ICON_FILE"
+  rm -f "$ICON_FILE" "$NAUTILUS_SCRIPT"
   if [[ -L $CLI_LINK && $(readlink -f "$CLI_LINK") == "$(readlink -f "$PLUGIN_DIR")/quickshare" ]]; then
     rm -f "$CLI_LINK"
     ok "removed $CLI_LINK"

@@ -5,8 +5,9 @@ Send files between your Omarchy PC and an Android or Samsung Galaxy phone with t
 ![The Quick Share icon and menu on the Omarchy bar](preview.png)
 
 - **Receive**: share from the phone, pick this PC, then choose **Accept** in the menu that pops up. The file lands in `~/Downloads`.
-- **Send**: click the bar icon and pick a file, or send your latest screenshot.
-- **One icon** on the bar. It shows when receiving is on and when a file is coming in or going out.
+- **Send**: click the bar icon and pick a file, send your latest screenshot, or right-click files in Nautilus → **Scripts → Send to phone (Quick Share)**.
+- **One icon** on the bar. It shows when receiving is on, and the progress of a file coming in or going out.
+- **Your own devices** can skip the Accept step.
 
 The Quick Share protocol comes from [quickshare-direct](https://github.com/papshmeare/quickshare-direct), over Bluetooth plus Wi-Fi Direct. This plugin adds the bar icon, the `quickshare` command, and Accept/Decline prompts that work with Omarchy's notifications.
 
@@ -40,6 +41,8 @@ If you only run the first command, the bar icon says *"isn't set up yet"*. Click
 | Wi-Fi region | Only if none is set: asks for your country (suggested from your timezone), then runs `iw reg set` and saves it in `/etc/conf.d/wireless-regdom` | yes |
 | Notifications | Installs the Quick Share icon in `~/.local/share/icons`, and writes one `PATH=` line to `~/.config/quickshare-direct/env` so Accept/Decline opens as an Omarchy menu ([why](#how-it-works)) | |
 | Command | Links `quickshare` into `~/.local/bin` | |
+| Sending | Installs `python-dbus` and `python-gobject`, for the Bluetooth beacon that wakes up the phone ([why](#sending)) | yes |
+| File manager | Adds **Send to phone (Quick Share)** to Nautilus' right-click → Scripts | |
 | Receiving | `systemctl --user enable --now quickshare-direct` | |
 | Bar | `omarchy plugin enable emanuel.quickshare` | |
 | Fast Wi-Fi | Asks once, default **no** ([details](#faster-transfers)) | yes |
@@ -52,24 +55,31 @@ If you only run the first command, the bar icon says *"isn't set up yet"*. Click
 
 **Receive:** on the phone, open **Share → Quick Share**, pick this PC (its host name), then choose **Accept** on the PC. With Omarchy's own notifications, a received photo shows up as a thumbnail.
 
-**Send:** first put the phone on its Quick Share receive screen, or set its visibility to *Everyone*. Then click the bar icon.
+**Send:** first put the phone on its Quick Share receive screen, visible to *Everyone*. Then click the bar icon, or select files in Nautilus and right-click → **Scripts → Send to phone (Quick Share)**. Accept on the phone; the PIN matches the one in the notification.
 
 | Bar icon | Action |
 |---|---|
-| Left click | Pick a recent file and send it |
+| Left click | Pick a recent file and send it; while sending, cancel |
 | Middle click | Open Downloads |
-| Right click | Menu: receiving on/off, fast Wi-Fi on/off, send a file, send the latest screenshot, open Downloads, check setup |
+| Right click | Menu: receiving on/off, fast Wi-Fi on/off, send a file, send the latest screenshot, open Downloads, trusted devices, check setup (and cancel, while sending) |
 
-The icon is an outline while receiving is off. It turns into a down arrow while a file comes in and an up arrow while one goes out.
+The icon is an outline while receiving is off. It turns into a down arrow while a file comes in and an up arrow while one goes out, then shows a ✓ for a moment when the transfer is done. Hover it during a transfer for the progress, the speed and the link it runs over (Wi-Fi Direct or Bluetooth). Clicking the "Received from" notification opens the file.
 
 ```bash
-quickshare send ~/file.pdf        # no file: opens a picker
+quickshare send ~/a.pdf ~/b.jpg   # no file: opens a picker
+quickshare cancel                 # stop the send in progress
+quickshare devices                # which phones the PC can see (Bluetooth and Wi-Fi)
 quickshare receive on|off|toggle
 quickshare fast on|off
+quickshare trust                  # list, or: trust add|remove "Emanuel's Tab S9+"
 quickshare menu                   # the right-click menu
 quickshare doctor                 # check the setup
-quickshare status                 # {"installed":…,"receiving":…,"fast":…}
+quickshare status                 # {"installed":…,"receiving":…,"fast":…,"sending":…}
 ```
+
+### Trusted devices
+
+Transfers from a trusted device are accepted without the Accept menu; a notification says so. Right-click → **Trusted devices…** offers the last device that sent you something, or use `quickshare trust add NAME` with the name the phone shows for itself. The name is all that's checked, and any phone nearby can call itself the same while it's visible to everyone. The worst it can do is drop a file in your Downloads folder, but keep that in mind.
 
 ## Faster transfers
 
@@ -88,7 +98,13 @@ quickshare-direct already tries to switch to Wi-Fi Direct. However, NetworkManag
 
 To prefer other channels, set `QS_GO_FREQS="2437 5180 …"` in `/etc/default/quickshare-direct`.
 
+The helper runs from a root-owned copy that a plugin update doesn't touch. `install.sh` refreshes it, and `quickshare doctor` flags a copy that doesn't match the plugin.
+
 </details>
+
+## Sending
+
+A phone on its Quick Share receive screen only announces itself once it hears a "device nearby is sharing" Bluetooth beacon. Samsung phones don't show up at all without it. quickshare-direct looks for the phone but doesn't send that beacon, so `quickshare send` sends it ([`scripts/qs-beacon`](scripts/qs-beacon)) for as long as it looks. Other Android phones nearby with Quick Share on may briefly show "a device nearby is sharing" too, just as they do when a phone shares.
 
 ## Troubleshooting
 
@@ -96,7 +112,7 @@ Start with `quickshare doctor`, or right-click → **Check setup**. Each ✗ com
 
 - **The phone doesn't list this PC.** Receiving must be on (a filled icon) and Bluetooth must be on. On the phone, set Quick Share's visibility to *Everyone*.
 - **Accept never appears, and the transfer times out.** Doctor shows whether prompts are routed. Every notification the receiver sends is logged to `~/.cache/quickshare-direct/notify.log`.
-- **Sending says no phone was found.** The phone has to be on its Quick Share receive screen when you click send. The PC finds it over Bluetooth LE; to check that by itself, run `quickshare-direct devices` while the phone is on that screen. With some phones (seen with a Galaxy S24 Ultra), the scan never finds the phone even though receiving from it works. That happens inside quickshare-direct, not in this plugin.
+- **Sending says no phone was found.** The phone has to be on its Quick Share receive screen, visible to *Everyone*, with the screen on. Run `quickshare devices` while it is. It lists the phones the PC finds over Bluetooth, and, under *On this Wi-Fi network*, the ones announcing themselves on your network. quickshare-direct sends over Bluetooth only. A phone that shows up on the network but not over Bluetooth is a quickshare-direct limitation; please report it there with that output.
 - **Transfers are slow.** That's Bluetooth. See [faster transfers](#faster-transfers).
 - **Receiver logs:** `journalctl --user -u quickshare-direct -f`
 
@@ -107,19 +123,20 @@ omarchy plugin update emanuel.quickshare
 ~/.config/omarchy/plugins/emanuel.quickshare/install.sh --uninstall
 ```
 
-Uninstalling turns off fast mode and receiving, removes the prompt routing and the `quickshare` link, and then removes the plugin. It asks before it also removes the quickshare-direct package and its firewall rule.
+Uninstalling turns off fast mode and receiving, removes the prompt routing, the `quickshare` link and the Nautilus script, and then removes the plugin. It asks before it also removes the quickshare-direct package and its firewall rule.
 
 ## How it works
 
 quickshare-direct runs as a systemd user service and asks "accept this transfer?" with a notification that has Accept and Decline buttons. Omarchy's notification popups don't draw action buttons, so the question could never be answered. The installer puts [`bin/notify-send`](bin/notify-send) first on the receiver's `PATH`. That shim handles notifications three ways:
 
-- A notification with several actions becomes an Omarchy picker menu.
-- A single-action notification (like "Show in folder") stays a normal toast that runs the action when clicked.
+- A notification with several actions becomes an Omarchy picker menu. If the menu closes the moment it opens (another menu took its place), the shim asks once more, then falls back to a popup you click to accept.
+- A request from a [trusted device](#trusted-devices) is accepted right away.
+- A single-action notification (like "Show in folder") stays a normal toast that runs the action when clicked. For one received file, the click opens the file.
 - Everything else goes to the real `notify-send`.
 
 Each notification also gets the Quick Share icon, by its icon-theme name `omarchy-quickshare`. quickshare-direct asks for `network-wireless`, which most themes lack, so Omarchy's notifications would show no icon and [Omapager](https://github.com/omacom/omapager) a letter tile.
 
-The bar widget only drives the bundled [`quickshare`](quickshare) script. It reads `quickshare status` and follows the receiver's journal to see transfers as they happen.
+The bar widget only drives the bundled [`quickshare`](quickshare) script. It reads `quickshare status`, follows the receiver's journal to see transfers as they happen, and watches the state file `quickshare send` keeps in `$XDG_RUNTIME_DIR/quickshare/`, so a send started from Nautilus shows on the bar too.
 
 ## Credits and license
 
