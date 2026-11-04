@@ -106,6 +106,8 @@ The helper runs from a root-owned copy that a plugin update doesn't touch. `inst
 
 A phone on its Quick Share receive screen only announces itself once it hears a "device nearby is sharing" Bluetooth beacon. Samsung phones don't show up at all without it. quickshare-direct looks for the phone but doesn't send that beacon, so `quickshare send` sends it ([`scripts/qs-beacon`](scripts/qs-beacon)) for as long as it looks. Other Android phones nearby with Quick Share on may briefly show "a device nearby is sharing" too, just as they do when a phone shares.
 
+Why the Wi-Fi has to pause, everything tried to avoid it (including a NetworkManager patch), and measurements: [docs/wifi-direct-notes.md](docs/wifi-direct-notes.md).
+
 ## Troubleshooting
 
 Start with `quickshare doctor`, or right-click → **Check setup**. Each ✗ comes with the command that fixes it.
