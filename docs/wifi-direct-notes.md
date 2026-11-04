@@ -83,7 +83,7 @@ The ones that keep the Wi-Fi either never leave the local network, or the system
 | 1 | quickshare-direct's own helper (group through NetworkManager's wpa_supplicant) | NetworkManager removes the group; on a DFS network it also picked 5745 MHz |
 | 2 | v1.1.0 fast mode: take the card from NetworkManager, host the group alone on 2.4 GHz | **Works.** The Wi-Fi pauses; about 5 MB/s |
 | 3 | Group next to the connection, through NetworkManager's wpa_supplicant | NetworkManager removes it 0.2 ms after it starts |
-| 4 | Take the card, then rejoin the same network on our own wpa_supplicant and host the group next to it | The rejoin stays in "scanning" although the network is in range. Unresolved; local branch `wip/keep-wifi`, last attempt not tested |
+| 4 | Take the card, then rejoin the same network on our own wpa_supplicant and host the group next to it | The rejoin stays in "scanning" although the network is in range. Unresolved; branch [`wip/keep-wifi`](https://github.com/Emanuel4100/omarchy-quickshare/tree/wip/keep-wifi), last attempt not tested (`sudo system/quickshare-fastlink --check`) |
 | 5 | A second, private wpa_supplicant on its own interface | Impossible on the AX210 (see below) |
 | 6 | Let NetworkManager adopt the group | Impossible (see below) |
 | 7 | A plain hotspot next to the connection | The AX210 allows it only on the connection's channel, and 5 GHz is "no IR" |
@@ -169,7 +169,7 @@ Gotchas in the sandbox setup:
 
 In both runs with the patch, the phone joined the 2.4 GHz group (4–6 s after the offer), and the Wi-Fi on 5180 MHz stayed connected. "Sometimes fails" on the phone matches the stall. The likely suspect is the card alternating between the two channels (5180 MHz for the network, 2437 MHz for the group). Wi-Fi power save is already off (`wifi.powersave = 2`).
 
-The sandbox, build and swap scripts are in a local project, `~/Projects/nm-p2p-group-fix`; it isn't published yet.
+The patch, the sandbox, and the build and swap scripts are in [Emanuel4100/nm-p2p-group-fix](https://github.com/Emanuel4100/nm-p2p-group-fix) (private for now).
 
 ## 5. Next steps
 
@@ -181,3 +181,16 @@ The sandbox, build and swap scripts are in a local project, `~/Projects/nm-p2p-g
 - **NetworkManager:** carry the patch as a local Arch package (Arch's PKGBUILD plus the patch; roll back with the cached stock package), and propose it upstream on NetworkManager's GitLab.
 - **Sending:** confirm a PC → S24 transfer end to end. Report the missing beacon to quickshare-direct.
 - **Receiver stopped by something else:** on 2026-11-04 at 00:50:37, a `systemctl --user` call from the desktop session stopped the receiver mid-transfer. The cause is unknown.
+
+## Picking this up on another machine
+
+```bash
+omarchy plugin update emanuel.quickshare            # v1.2.0 and these notes
+git clone https://github.com/Emanuel4100/omarchy-quickshare ~/Projects/omarchy-quickshare
+git -C ~/Projects/omarchy-quickshare switch wip/keep-wifi   # only for approach #4
+git clone git@github.com:Emanuel4100/nm-p2p-group-fix.git ~/Projects/nm-p2p-group-fix
+```
+
+Then follow that repo's README. Check the Wi-Fi card first (`iw phy`): hosting a group next to the
+connection needs a combination with `P2P-GO` and `#channels <= 2`. Other cards may also mark
+different channels "no IR".
