@@ -284,7 +284,8 @@ add_to_bar() {
 offer_fast_mode() {
   step "Fast Wi-Fi transfers"
   if [[ -e $FAST_DROPIN ]]; then
-    if cmp -s "$PLUGIN_DIR/system/quickshare-fastlink" "$FAST_HELPER"; then
+    if cmp -s "$PLUGIN_DIR/system/quickshare-fastlink" "$FAST_HELPER" &&
+      cmp -s "$PLUGIN_DIR/system/quickshare-ap@.service.d/50-omarchy-fastlink.conf" "$FAST_DROPIN"; then
       ok "on"
     else
       echo "  updating its helper (asks for your password)"
@@ -293,7 +294,7 @@ offer_fast_mode() {
     return
   fi
   if (( FRESH )) && [[ $(iw phy 2>/dev/null) == *P2P-GO* ]] &&
-    confirm --default=false "Turn on fast Wi-Fi transfers? This PC's Wi-Fi pauses while a file transfers (see the README)."; then
+    confirm --default=false "Turn on fast Wi-Fi transfers? Your Wi-Fi stays connected where the card allows it, else it pauses during a transfer (see the README)."; then
     "$PLUGIN_DIR/quickshare" fast on
   else
     ok "off: transfers use Bluetooth (turn on any time: quickshare fast on)"

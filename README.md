@@ -69,7 +69,7 @@ The icon is an outline while receiving is off. It turns into a down arrow while 
 quickshare send ~/a.pdf ~/b.jpg   # no file: opens a picker
 quickshare cancel                 # stop the send in progress
 quickshare devices                # which phones the PC can see (Bluetooth and Wi-Fi)
-quickshare receive on|off|toggle
+quickshare receive on|off|toggle  # off during a transfer needs --force
 quickshare fast on|off
 quickshare trust                  # list, or: trust add|remove "Emanuel's Tab S9+"
 quickshare menu                   # the right-click menu
@@ -83,30 +83,29 @@ Transfers from a trusted device are accepted without the Accept menu; a notifica
 
 ## Faster transfers
 
-Without fast mode, transfers go over Bluetooth at a few KB/s. That's fine for a photo but slow for a video. `quickshare fast on` moves transfers to Wi-Fi Direct. **This PC's Wi-Fi and internet pause for as long as a transfer runs**, then reconnect by themselves. `quickshare fast off` undoes it.
+Without fast mode, transfers go over Bluetooth at a few KB/s. That's fine for a photo but slow for a video. `quickshare fast on` moves transfers to Wi-Fi Direct. **This PC's Wi-Fi stays connected during a transfer** on cards that can run a Wi-Fi Direct group next to a connection, as Intel's can. Elsewhere, the Wi-Fi and internet pause for as long as a transfer runs, then reconnect by themselves. `quickshare fast off` undoes it.
 
 <details>
-<summary>Why the Wi-Fi has to pause</summary>
+<summary>How fast mode gets around NetworkManager</summary>
 
 quickshare-direct already tries to switch to Wi-Fi Direct. However, NetworkManager shuts down any Wi-Fi Direct group it didn't start itself, about a millisecond after the group comes up (`P2P: WPA supplicant notified a group start but we are not trying to connect!`). So without fast mode, every transfer stays on Bluetooth.
 
-`quickshare fast on` asks for your password. It then installs `system/quickshare-fastlink` to `/usr/local/lib/omarchy-quickshare/`, along with a drop-in for `quickshare-ap@.service`. During a transfer, the helper:
+`quickshare fast on` asks for your password. It then installs `system/quickshare-fastlink` to `/usr/local/lib/omarchy-quickshare/`, along with a drop-in for `quickshare-ap@.service`. For each transfer, the helper tries two ways:
 
-1. takes the Wi-Fi card away from NetworkManager;
-2. hosts the Wi-Fi Direct group itself, on 2.4 GHz by default, because Galaxy phones won't join a group on 5745 MHz;
-3. hands the card back and reconnects to your network when the transfer ends.
+1. **Keep the Wi-Fi.** NetworkManager removes the group with a single D-Bus call to wpa_supplicant, and doesn't check whether that call worked. So the helper adds a D-Bus rule that refuses that one call, starts the group through NetworkManager's own wpa_supplicant next to your connection, and deletes the rule again a second later. NetworkManager itself isn't changed. The group goes on 2.4 GHz by default, because Galaxy phones won't join a group on 5745 MHz or on radar channels. When your network is on 2.4 GHz, the group shares its channel.
+2. **Pause the Wi-Fi**, if the first way fails. The helper takes the Wi-Fi card away from NetworkManager, hosts the group itself, then hands the card back and reconnects to your network when the transfer ends.
 
-To prefer other channels, set `QS_GO_FREQS="2437 5180 …"` in `/etc/default/quickshare-direct`.
+The journal says which way a transfer took: `journalctl -u 'quickshare-ap@*' -g 'Wi-Fi kept|paused'`. To prefer other channels, set `QS_GO_FREQS="2437 5180 …"` in `/etc/default/quickshare-direct`. To always pause the Wi-Fi, set `QS_KEEP_WIFI=0` there.
 
 The helper runs from a root-owned copy that a plugin update doesn't touch. `install.sh` refreshes it, and `quickshare doctor` flags a copy that doesn't match the plugin.
 
 </details>
 
+Why NetworkManager breaks Wi-Fi Direct, everything tried around it, and measurements: [docs/wifi-direct-notes.md](docs/wifi-direct-notes.md). To see where a slow transfer stalls, run `sudo scripts/qs-trace` while it runs (section 5 there).
+
 ## Sending
 
 A phone on its Quick Share receive screen only announces itself once it hears a "device nearby is sharing" Bluetooth beacon. Samsung phones don't show up at all without it. quickshare-direct looks for the phone but doesn't send that beacon, so `quickshare send` sends it ([`scripts/qs-beacon`](scripts/qs-beacon)) for as long as it looks. Other Android phones nearby with Quick Share on may briefly show "a device nearby is sharing" too, just as they do when a phone shares.
-
-Why the Wi-Fi has to pause, everything tried to avoid it (including a NetworkManager patch), and measurements: [docs/wifi-direct-notes.md](docs/wifi-direct-notes.md).
 
 ## Troubleshooting
 

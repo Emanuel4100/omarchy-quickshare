@@ -5,7 +5,7 @@ These notes come from trying to fix two things in this plugin:
 1. Sending from the PC to an Android phone (a Galaxy S24 Ultra) never found the phone.
 2. Fast mode pauses the PC's Wi-Fi for as long as a transfer runs.
 
-Last updated 2026-11-04. Test setup:
+Last updated 2026-11-14 (section 5 re-reads the Nov 4 tests). Test setup:
 
 - **PC:** an Omarchy desktop with an Intel AX210 Wi-Fi card (`iwlwifi`), kernel 7.2, NetworkManager 1.58.1, wpa_supplicant 2.12, quickshare-direct 0.1.5.
 - **Phones:** a Galaxy S24 Ultra and a Galaxy Tab S9+.
@@ -17,7 +17,8 @@ Last updated 2026-11-04. Test setup:
 | Phone → PC over Bluetooth, then Wi-Fi Direct (fast mode) | Works. The PC's Wi-Fi pauses during the transfer; about 5 MB/s. |
 | PC → Galaxy phone: finding the phone | Fixed in v1.2.0 with a wake-up beacon (section 1). |
 | PC → Galaxy phone: the transfer itself | Not confirmed yet. |
-| Fast transfers that keep the PC's Wi-Fi connected | Works only with a patched NetworkManager (section 4): about 1.7 MB/s, and one of two big transfers stalled. |
+| Fast transfers that keep the PC's Wi-Fi connected | Works with stock NetworkManager since 2026-11-14: a D-Bus rule refuses NetworkManager's teardown call for a second while the group starts (§3, #9). Confirmed with a 197 MB transfer from the S24 Ultra; the Wi-Fi stayed connected throughout. The NetworkManager patch (section 4) does the same from the inside. |
+| Transfer speed | Transfers run either slowly (about 1 MB/s with stalls of several seconds) or fast (5–9 MB/s), with or without the patch. The cause isn't known yet (section 5). |
 
 ## 1. Sending to Samsung phones: the wake-up beacon
 
@@ -49,7 +50,7 @@ The mechanism, in NetworkManager 1.58:
 
 No setting turns this off.
 
-The only way around it with stock NetworkManager is to take the Wi-Fi card away from NetworkManager for the transfer. That's what fast mode's helper ([`system/quickshare-fastlink`](../system/quickshare-fastlink)) does, and it's why the Wi-Fi pauses.
+Until 2026-11-14, the only known way around it with stock NetworkManager was to take the Wi-Fi card away from NetworkManager for the transfer, which is why fast mode paused the Wi-Fi. NetworkManager sends that `RemoveInterface` without waiting for an answer and never repeats it. So refusing it on the bus for a moment is enough (§3, #9), and fast mode's helper ([`system/quickshare-fastlink`](../system/quickshare-fastlink)) now does that first.
 
 At one point this looked like a channel or regulatory problem instead. The source and the logs above settled it.
 
@@ -87,7 +88,8 @@ The ones that keep the Wi-Fi either never leave the local network, or the system
 | 5 | A second, private wpa_supplicant on its own interface | Impossible on the AX210 (see below) |
 | 6 | Let NetworkManager adopt the group | Impossible (see below) |
 | 7 | A plain hotspot next to the connection | The AX210 allows it only on the connection's channel, and 5 GHz is "no IR" |
-| 8 | Patch NetworkManager so it keeps groups it didn't start | **Works** in a sandbox and on real hardware; slower, and one stall (section 4) |
+| 8 | Patch NetworkManager so it keeps groups it didn't start | **Works** in a sandbox and on real hardware; the "stall" was a manual stop (sections 4 and 5) |
+| 9 | Stock NetworkManager, with a D-Bus policy that refuses its `RemoveInterface` for about a second while the group starts | **Works.** Probe and a real transfer on 2026-11-14: the bus refused NetworkManager's `RemoveInterface` 0.1 ms after its "Ignoring the event", and the group on 2437 MHz stayed up next to the Wi-Fi on 5260 MHz. 197 MB in 164 s (1.2 MB/s, 8 stalls of 4–12 s: the slow phase of section 5). Fast mode's default now; it falls back to #2 when the bus doesn't enforce the rule or the group still goes away |
 
 **Why #5 is impossible on the AX210:**
 - wpa_supplicant switches any interface it's given to normal client mode and brings it up (`driver_nl80211.c`, around line 3555). The card allows only one normal interface, and NetworkManager's is it.
@@ -104,7 +106,7 @@ Phones use random Wi-Fi Direct addresses that appear only once they're joining, 
 
 | Option | Effect |
 |---|---|
-| Ethernet on the desktop | The Wi-Fi card is free for transfers, and nothing is lost when it pauses |
+| Ethernet on the desktop (it has a port, `enp5s0`) | The Wi-Fi card is free for transfers, and nothing is lost when it pauses: stock fast mode is enough |
 | A USB Wi-Fi adapter just for Quick Share | Full speed, no pause |
 | Transfers over the local network (`QSD_BWU=lan` in quickshare-direct) | Never touches the Wi-Fi, but only works when the phone is on the same network |
 | Wi-Fi Aware (NAN), which the phones offer first | Linux NAN data path support is still unmerged patches (2026), and quickshare-direct doesn't speak it |
@@ -164,28 +166,79 @@ Gotchas in the sandbox setup:
 | Mode | Size | Result | Speed | Wi-Fi |
 |---|---|---|---|---|
 | Stock NetworkManager, card taken over (v1.1.0 fast mode) | 79 MB | Done in about 15 s | ~5 MB/s | Paused |
-| Patched NetworkManager, group next to the connection | 677 MB | Stalled at 136 MB after about 2 min | ~1.1 MB/s | Kept |
+| Patched NetworkManager, group next to the connection | 677 MB | Stopped at 136 MB after 3.6 min by "Stop receiving"; data was still arriving (section 5) | ~0.6 MB/s | Kept |
 | Patched NetworkManager, group next to the connection | 269 MB | Done in about 155 s | ~1.7 MB/s | Kept |
 
-In both runs with the patch, the phone joined the 2.4 GHz group (4–6 s after the offer), and the Wi-Fi on 5180 MHz stayed connected. "Sometimes fails" on the phone matches the stall. The likely suspect is the card alternating between the two channels (5180 MHz for the network, 2437 MHz for the group). Wi-Fi power save is already off (`wifi.powersave = 2`).
+In both runs with the patch, the phone joined the 2.4 GHz group (4–6 s after the offer), and the Wi-Fi on 5180 MHz stayed connected. These notes first blamed the slowness and the "stall" on the card alternating between the two channels (5180 MHz for the network, 2437 MHz for the group). Section 5 shows the "stall" was a manual stop, and that the same slowness happens with the Wi-Fi paused. Wi-Fi power save is off (`wifi.powersave = 2`).
+
+Re-checked on 2026-11-14 against NetworkManager's source: on the "Ignoring the event" path, the patch sets the group's wrapper to DOWN before its last reference drops, so `dispose()` no longer calls `RemoveInterface`. No other problem found.
 
 The patch, the sandbox, and the build and swap scripts are in [Emanuel4100/nm-p2p-group-fix](https://github.com/Emanuel4100/nm-p2p-group-fix) (private for now).
 
-## 5. Next steps
+## 5. Why transfers are slow (re-checked 2026-11-14)
 
-- **Find out why the patched setup is slower and stalls.**
-  - Repeat with the PC on a 2.4 GHz network. If the group shares the connection's channel and the stalls stop, the channel alternation is the cause.
-  - During a stall, look at `iw dev p2p-wlp6s0-0 station dump` (retries, signal) and the wpa_supplicant and NetworkManager logs.
-  - Check quickshare-direct's `Unhandled offline frame ... type 12`, logged around the stall.
-- **Plugin:** start the group next to the connection first, and fall back to pausing the Wi-Fi when NetworkManager removes it. That works with stock and patched NetworkManager alike.
+The Nov 4 journal still holds every transfer. [`scripts/qs-trace`](../scripts/qs-trace) `report --journal SINCE UNTIL` rebuilds each one from the receiver's "Processing PayloadType::File" lines, one per 512 KiB chunk. Sizes here are in MB (10⁶ bytes); the phone's "269 MB" counts MiB.
+
+| Run (Nov 4) | Mode | Received | Average | Stalls ≥ 3 s | Shape |
+|---|---|---|---|---|---|
+| 00:32 | stock, Wi-Fi paused | 450 MB | 6.4 MB/s | 0 | fast throughout |
+| 00:48 | stock, Wi-Fi paused | 324 MB, then stopped | 2.5 MB/s | 4 (16 s) | about 1 MB/s for 92 s, then 5–9 MB/s |
+| 01:54 | stock, Wi-Fi paused | 80 MB | 5.5 MB/s | 0 | fast throughout |
+| 01:56 | patched, Wi-Fi kept | 136 MB, then stopped | 0.6 MB/s | 12 (72 s) | slow throughout |
+| 02:00 | patched, Wi-Fi kept | 284 MB | 1.8 MB/s | 7 (39 s) | about 0.7 MB/s for 123 s, then about 6 MB/s |
+
+What this shows:
+
+- **The 136 MB "stall" was a manual stop.** Chunks kept arriving until 02:00:30.07. Then a `systemctl` started from the desktop (`wayland-wm@hyprland`) ran a user daemon-reload and stopped the receiver. That pair is `systemctl --user disable --now`, which is what `quickshare receive off` runs. It's the bar menu's "Stop receiving", which used to be the menu's first row. The receiver was switched back on 2.2 s later.
+  - The stop at 00:50:37 that these notes called "cause unknown" has the same signature.
+  - Since then, "Stop receiving" asks first while a file is still coming in, it has moved further down the menu, and every stop is logged (`journalctl -t quickshare`).
+- **Transfers run either slowly or fast, and the switch is sudden.** In the 00:48 and 02:00 runs, the rate jumped from 2–3 chunks/s to 10–12 chunks/s within one second (at 00:50:00 and at 02:02:53). Nothing logged on the PC changed at either moment.
+- **It isn't the patch, and it isn't only the channel hopping.** The 00:48 run had the Wi-Fi paused and the group alone on 2.4 GHz, and it shows the same slow phase. That points at the phone, for example its screen, its own Wi-Fi network (it splits its radio between that network and our group too), or Quick Share still looking for devices. Bluetooth next to the 2.4 GHz group is another suspect.
+- **Frame type 12** ("Unhandled offline frame", probably Nearby's BANDWIDTH_UPGRADE_RETRY; the number isn't confirmed) also appears in the stock runs, and data keeps flowing after it. It isn't the stall.
+- **The Omarchy network panel scans the Wi-Fi while it's open** (it turns on Quickshell's scanner). A full scan on the AX210 (2.4, 5 and 6 GHz) takes seconds. It was opened at 01:56:48, just before the 01:56 run slowed down. That's worth ruling out, but it doesn't explain the slow phase with the Wi-Fi paused.
+
+### Measuring it: `qs-trace`
+
+```bash
+sudo scripts/qs-trace --label B --wpa-debug --nm-debug   # Ctrl-C when the transfer is done
+scripts/qs-trace report ~/quickshare-traces/<run>        # again, or with --min-stall 3
+```
+
+A capture records:
+
+- the size of the incoming file every 0.5 s;
+- `iw event` (scans, channel switches);
+- the group's station dump (retries, failures, signal) every second;
+- `btmon`;
+- the whole journal.
+
+With `--wpa-debug` / `--nm-debug` it also raises wpa_supplicant's and NetworkManager's Wi-Fi logging, and puts the old levels back afterwards. The report lists each stall with what happened from 2 s before it until it ended, then counts how many stalls each kind of event lines up with, compared with how often that kind shows up while data flows.
+
+Test runs: send the same ~500 MB video each time, and note when the phone's screen goes off.
+
+| Run | PC | Phone | Tells whether… |
+|---|---|---|---|
+| A | stock, fast mode (Wi-Fi paused) | on its home Wi-Fi, screen left on | the slow phase happens without the patch (baseline) |
+| A2 | as A | screen off right after accepting | the phone's screen ends the slow phase |
+| B | patched (`realtest.sh on`), network panel closed | as A | PC-side scans cause the stalls |
+| C | as B | Wi-Fi on but not connected to any network | it's the phone splitting its radio |
+| D | as B, PC on the router's 2.4 GHz band (the group then shares its channel) | as A | it's channel hopping on the PC |
+| E | as B, with the PC's other Bluetooth jobs stopped (sensor timers, KDE Connect) | as A | it's Bluetooth next to the 2.4 GHz group |
+
+## 6. Next steps
+
+- **Find what makes the slow phase:** the test runs above, then the matching fix:
+  - PC scans: hold them off while the link is up.
+  - The phone: document the setting that avoids it.
+  - Bluetooth: quiet the Bluetooth jobs during transfers.
+- **Plugin:** release #9 (confirmed with a 197 MB transfer on 2026-11-14).
 - **NetworkManager:** carry the patch as a local Arch package (Arch's PKGBUILD plus the patch; roll back with the cached stock package), and propose it upstream on NetworkManager's GitLab.
 - **Sending:** confirm a PC → S24 transfer end to end. Report the missing beacon to quickshare-direct.
-- **Receiver stopped by something else:** on 2026-11-04 at 00:50:37, a `systemctl --user` call from the desktop session stopped the receiver mid-transfer. The cause is unknown.
 
 ## Picking this up on another machine
 
 ```bash
-omarchy plugin update emanuel.quickshare            # v1.2.0 and these notes
+omarchy plugin update emanuel.quickshare            # v1.3.0 and these notes
 git clone https://github.com/Emanuel4100/omarchy-quickshare ~/Projects/omarchy-quickshare
 git -C ~/Projects/omarchy-quickshare switch wip/keep-wifi   # only for approach #4
 git clone git@github.com:Emanuel4100/nm-p2p-group-fix.git ~/Projects/nm-p2p-group-fix

@@ -1,0 +1,518 @@
+#!/usr/bin/env bash
+# qs-trace: record what the Wi-Fi, Bluetooth and the receiver do during a Quick Share transfer,
+# then line the transfer's stalls up with it. Background: docs/wifi-direct-notes.md.
+#
+#   sudo qs-trace [--label NAME] [--for SECONDS] [--wpa-debug] [--nm-debug] [--out DIR]
+#       Capture until Ctrl-C (or for SECONDS), then write report.txt next to the logs, in
+#       ~/quickshare-traces/<date>-<label>/ (owned by the user who ran sudo).
+#       --wpa-debug, --nm-debug: raise wpa_supplicant's / NetworkManager's Wi-Fi logging for the
+#       run (scans, listen, remain-on-channel); the old levels are put back afterwards.
+#   qs-trace report DIR [--min-stall SECONDS]
+#   qs-trace report --journal SINCE UNTIL [--min-stall SECONDS]
+#       The second form needs no capture: it rebuilds the transfer from the receiver's journal
+#       ("Processing PayloadType::File", one line per ~512 KiB chunk), for transfers already done.
+#
+# A capture holds: context.txt (versions, which NetworkManager and fast-mode helper run, the
+# connection's channel), throughput.tsv (the size of each file the receiver is writing, every
+# 0.5 s), iw-event.log (scans, channel switches, connects), link.log (the group's station dump
+# and the connection's link, every second), btmon.log (Bluetooth HCI traffic) and journal.log
+# (the whole system journal).
+set -uo pipefail
+
+die() { echo "qs-trace: $*" >&2; exit 1; }
+
+usage() { sed -n '5,13p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-2}"; }
+
+# The pid of $user's quickshare-direct, or 0.
+receiver_pid() {
+  local pid
+  pid=$(systemctl --user -M "$user@" show -p MainPID --value quickshare-direct.service 2>/dev/null)
+  [[ $pid =~ ^[1-9][0-9]*$ ]] || pid=$(pgrep -u "$user" -f '^(/usr/bin/)?quickshare-direct( |$)' | head -1)
+  echo "${pid:-0}"
+}
+
+# Every 0.5 s: time, size and name of each regular file the receiver has open for writing (the
+# incoming files; see incoming_file in ../quickshare).
+sample_files() {
+  local pid=0 fd target flags k v t size
+  printf 'time\tsize\tfile\n'
+  while :; do
+    [[ $pid != 0 && -d /proc/$pid ]] || pid=$(receiver_pid)
+    t=$EPOCHREALTIME
+    if [[ $pid != 0 ]]; then
+      for fd in /proc/"$pid"/fd/*; do
+        (( ${fd##*/} > 2 )) || continue
+        target=$(readlink "$fd" 2>/dev/null) || continue
+        [[ $target == /* && $target != /dev/* && $target != /proc/* && $target != /sys/* && -f $fd ]] || continue
+        flags=0
+        while read -r k v _; do [[ $k == flags: ]] && { flags=$v; break; }; done < "/proc/$pid/fdinfo/${fd##*/}"
+        (( 8#$flags & 3 )) || continue # O_WRONLY or O_RDWR
+        size=$(stat -L -c %s "$fd" 2>/dev/null) || continue
+        printf '%s\t%s\t%s\n' "$t" "$size" "${target##*/}"
+      done
+    fi
+    sleep 0.5
+  done
+}
+
+# Every second: the station dump of each group (or hotspot) interface, and the connection's link.
+sample_link() {
+  local devs g s
+  while :; do
+    printf '### %s\n' "$EPOCHREALTIME"
+    devs=$(iw dev 2>/dev/null)
+    while read -r g; do
+      [[ -n $g ]] || continue
+      printf '## group %s\n' "$g"
+      iw dev "$g" station dump 2>&1
+    done < <(awk '/Interface/ {i=$2} /type (P2P-GO|P2P-client|AP)$/ {print i}' <<< "$devs")
+    s=$(awk '/Interface/ {i=$2} /type managed$/ {print i; exit}' <<< "$devs")
+    [[ -n $s ]] && { printf '## sta %s\n' "$s"; iw dev "$s" link 2>&1; }
+    sleep 1
+  done
+}
+
+WPAS=(fi.w1.wpa_supplicant1 /fi/w1/wpa_supplicant1 fi.w1.wpa_supplicant1)
+
+debug_on() {
+  if (( wpa_debug )); then
+    old_wpa_level=$(busctl get-property "${WPAS[@]}" DebugLevel 2>/dev/null | sed -n 's/^s "\(.*\)"$/\1/p')
+    old_wpa_ts=$(busctl get-property "${WPAS[@]}" DebugTimestamp 2>/dev/null | awk '{print $2}')
+    if [[ -n $old_wpa_level ]] && busctl set-property "${WPAS[@]}" DebugLevel s debug &&
+      busctl set-property "${WPAS[@]}" DebugTimestamp b true; then
+      echo "wpa_supplicant logging: debug for this run (was $old_wpa_level)"
+    else
+      echo "qs-trace: couldn't raise wpa_supplicant's logging" >&2
+    fi
+  fi
+  if (( nm_debug )); then
+    old_nm_level=$(nmcli -t -e no -f LEVEL general logging 2>/dev/null)
+    old_nm_domains=$(nmcli -t -e no -f DOMAINS general logging 2>/dev/null)
+    if [[ -n $old_nm_level && -n $old_nm_domains ]] &&
+      nmcli general logging level "$old_nm_level" domains "$old_nm_domains,WIFI:DEBUG,WIFI_SCAN:DEBUG"; then
+      echo "NetworkManager logging: WIFI and WIFI_SCAN at debug for this run"
+    else
+      old_nm_level=
+      echo "qs-trace: couldn't raise NetworkManager's logging" >&2
+    fi
+  fi
+}
+
+debug_off() {
+  if [[ -n ${old_wpa_level:-} ]]; then
+    busctl set-property "${WPAS[@]}" DebugLevel s "$old_wpa_level"
+    [[ -n ${old_wpa_ts:-} ]] && busctl set-property "${WPAS[@]}" DebugTimestamp b "$old_wpa_ts"
+  fi
+  if [[ -n ${old_nm_level:-} ]]; then
+    nmcli general logging level "$old_nm_level" domains "$old_nm_domains"
+  fi
+}
+
+write_context() {
+  local sta helper
+  sta=$(iw dev 2>/dev/null | awk '/Interface/ {i=$2} /type managed$/ {print i; exit}')
+  helper=$(systemctl cat "quickshare-ap@$user.service" 2>/dev/null |
+    awk -F= '/^ExecStart=./ {e=$2} END {print e ? e : "none (no quickshare-ap@ unit)"}')
+  echo "qs-trace${label:+ \"$label\"} started $(date '+%F %T %Z')"
+  echo "kernel $(uname -r); wpa_supplicant $(wpa_supplicant -v 2>/dev/null | awk 'NR==1 {print $2}')"
+  printf 'NetworkManager %s' "$(NetworkManager --version 2>/dev/null)"
+  if findmnt -rn --target /usr/bin/NetworkManager -o TARGET 2>/dev/null | grep -qx /usr/bin/NetworkManager; then
+    echo " (a build bind-mounted over the system's: nm-p2p-group-fix's realtest.sh)"
+  else
+    echo " (the system's)"
+  fi
+  echo "fast-mode helper: $helper"
+  echo "receiver pid: $(receiver_pid)"
+  if [[ -n $sta ]]; then
+    echo "station $sta:"
+    iw dev "$sta" link 2>&1 | grep -E 'Connected|Not connected|SSID|freq|signal|bitrate' | sed 's/^\s*/  /'
+  fi
+  echo "iw dev:"
+  iw dev 2>&1 | sed 's/^/  /'
+}
+
+capture() {
+  local label="" secs=0 out="" pids=() parent
+  wpa_debug=0 nm_debug=0
+  while (( $# )); do
+    case $1 in
+      --label) label=${2:?--label needs a name}; shift 2 ;;
+      --for) secs=${2:?--for needs seconds}; shift 2 ;;
+      --wpa-debug) wpa_debug=1; shift ;;
+      --nm-debug) nm_debug=1; shift ;;
+      --out) out=${2:?--out needs a directory}; shift 2 ;;
+      -h|--help) usage 0 ;;
+      *) usage ;;
+    esac
+  done
+  [[ $secs =~ ^[0-9]+$ ]] || die "--for takes whole seconds"
+  [[ $(id -u) == 0 ]] || die "run it with sudo (it reads wpa_supplicant, btmon and the whole journal)"
+  user=${SUDO_USER:-}
+  [[ -n $user && $user != root ]] || die "run it with sudo from your own account"
+  home=$(getent passwd "$user" | cut -d: -f6)
+  out=${out:-$home/quickshare-traces/$(date +%Y%m%d-%H%M%S)${label:+-${label//[^A-Za-z0-9._-]/_}}}
+  parent=${out%/*}
+  [[ -d $parent ]] || runuser -u "$user" -- mkdir -p "$parent" || die "can't create $parent"
+  mkdir -p "$out" || die "can't create $out"
+  cd "$out" || die "can't enter $out"
+
+  write_context > context.txt
+  # Not in a pipeline: debug_on keeps the old levels in variables for debug_off.
+  debug_on >> context.txt 2>&1
+  grep -i 'logging' context.txt
+
+  sample_files > throughput.tsv & pids+=($!)
+  sample_link > link.log 2>&1 & pids+=($!)
+  iw event -t -f > iw-event.log 2>&1 & pids+=($!)
+  if command -v btmon >/dev/null; then
+    btmon -T > btmon.log 2>&1 & pids+=($!)
+  else
+    echo "no btmon (bluez-utils): Bluetooth traffic isn't recorded" | tee -a context.txt
+  fi
+  journalctl -f -n 0 -o short-unix > journal.log 2>&1 & pids+=($!)
+
+  stop() {
+    trap - INT TERM
+    kill "${pids[@]}" 2>/dev/null
+    wait "${pids[@]}" 2>/dev/null
+    debug_off
+    echo "stopped $(date '+%F %T %Z')" >> context.txt
+    report "$out" > report.txt 2>&1
+    chown -R "$user:" "$out"
+    echo
+    sed -n '/^Transfer/,/^$/p; /^No transfer/p' report.txt
+    echo "Report and logs: $out/report.txt"
+    exit 0
+  }
+  trap stop INT TERM
+
+  echo "Recording to $out"
+  if (( secs )); then
+    echo "Send the file from the phone now; recording for $secs s (Ctrl-C stops early)."
+    sleep "$secs" & pids+=($!)
+    wait $!
+  else
+    echo "Send the file from the phone now; press Ctrl-C when the transfer is done."
+    wait "${pids[0]}"
+  fi
+  stop
+}
+
+report() {
+  python3 -I - "$@" <<'PY'
+import datetime, re, subprocess, sys
+
+CHUNK = 512 * 1024     # bytes per "Processing PayloadType::File" line (Nearby's Wi-Fi chunk)
+PRE = 2.0              # seconds before a stall whose events still count for it
+ANSI = re.compile(r'\x1b\[[0-9;]*m')
+
+
+def hms(t):
+    return datetime.datetime.fromtimestamp(t).strftime('%H:%M:%S.%f')[:-3]
+
+
+def mb(n):
+    return n / 1e6
+
+
+class Trace:
+    def __init__(self):
+        self.growth = []   # (time, bytes received)
+        self.points = []   # (time, kind, detail)
+        self.spans = []    # (start, end, kind, detail)
+        self.link = []     # (time, {field: value}) for the group's station
+        self.context = ''
+
+    def point(self, t, kind, detail=''):
+        self.points.append((t, kind, detail))
+
+
+def journal_lines(tr, lines, chunks):
+    jline = re.compile(r'^(\d+\.\d+) \S+ ([^\s\[:]+)(?:\[\d+\])?: (.*)$')
+    for line in lines:
+        m = jline.match(ANSI.sub('', line.rstrip('\n')))
+        if not m:
+            continue
+        t, ident, msg = float(m[1]), m[2], m[3]
+        if ident == 'quickshare-direct':
+            if 'Processing PayloadType::File' in msg:
+                if chunks:
+                    tr.growth.append((t, CHUNK))
+            elif 'Unhandled offline frame' in msg:
+                tr.point(t, 'phone frame type 12')
+            elif re.search(r'weave: connected|ConnectionRequest', msg):
+                tr.point(t, 'phone Bluetooth session', msg.split(': ', 1)[-1][:60])
+            elif msg.endswith('Stopping.'):
+                tr.point(t, 'receiver stopped')
+        elif ident == 'quickshare':
+            tr.point(t, 'receiver stopped', msg)
+        elif ident == 'wpa_supplicant':
+            if re.search(r'CTRL-EVENT-SCAN-STARTED|radio work .scan|Setting scan request|bgscan', msg):
+                tr.point(t, 'wpa_supplicant scan', msg[:70])
+            elif re.search(r'[Ll]isten|remain.on.channel|P2P-FIND|p2p_find|[Ss]tart(ing)? find', msg):
+                tr.point(t, 'P2P listen/find', msg[:70])
+            elif re.search(r'AP-STA-DISCONNECTED|CTRL-EVENT-DISCONNECTED|P2P-GROUP-REMOVED', msg):
+                tr.point(t, 'Wi-Fi link dropped', msg[:70])
+            elif re.search(r'BEACON-LOSS|CHANNEL-SWITCH|SIGNAL-CHANGE', msg):
+                tr.point(t, 'Wi-Fi event', msg[:70])
+        elif ident == 'NetworkManager':
+            if re.search(r'scan', msg, re.I) and 'BSS' not in msg:
+                tr.point(t, 'NetworkManager scan', msg[:70])
+        elif ident == 'kernel':
+            if 'UFW' not in msg and re.search(r'iwlwifi|wlp|wlan|p2p-', msg):
+                tr.point(t, 'kernel Wi-Fi', msg[:70])
+        elif ident == 'bluetoothd':
+            tr.point(t, 'bluetoothd', msg[:60])
+
+
+def iw_events(tr, path):
+    line_re = re.compile(r'^(\d+\.\d+): (.+?) \(phy #\d+\): (.*)$')
+    open_scan = {}
+    try:
+        lines = open(path, errors='replace').read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        m = line_re.match(line)
+        if not m:
+            continue
+        t, dev, msg = float(m[1]), m[2], m[3]
+        if msg.startswith('scan started'):
+            open_scan[dev] = t
+        elif msg.startswith(('scan finished', 'scan aborted', 'new scan results')):
+            freqs = len(re.findall(r'\b\d{4}\b', msg.split('"')[0]))
+            what = f"{dev}{', aborted' if 'aborted' in msg else ''}{f', {freqs} channels' if freqs else ''}"
+            start = open_scan.pop(dev, None)
+            if start is None:
+                tr.point(t, 'Wi-Fi scan', what)
+            else:
+                tr.spans.append((start, t, 'Wi-Fi scan', f'{what}, {t - start:.1f} s'))
+        elif 'remain on freq' in msg and not msg.startswith('done'):
+            tr.point(t, 'remain-on-channel', f'{dev}: {msg[:50]}')
+        elif re.search(r'ch_switch|channel switch', msg, re.I):
+            tr.point(t, 'channel switch', f'{dev}: {msg[:50]}')
+        elif re.search(r'disconnect|deauth|disassoc', msg):
+            tr.point(t, 'Wi-Fi link dropped', f'{dev}: {msg[:50]}')
+    for dev, start in open_scan.items():
+        tr.spans.append((start, start + 1.0, 'Wi-Fi scan', f'{dev}, no end seen'))
+
+
+def btmon_events(tr, path):
+    ts = re.compile(r'(\d{4}-\d\d-\d\d) (\d\d:\d\d:\d\d\.\d+)\s*$')
+    try:
+        lines = open(path, errors='replace').read().splitlines()
+    except OSError:
+        return
+    for i, line in enumerate(lines):
+        if not line[:2] in ('< ', '> '):
+            continue
+        m = ts.search(line)
+        if not m:
+            continue
+        t = datetime.datetime.strptime(f'{m[1]} {m[2]}', '%Y-%m-%d %H:%M:%S.%f').timestamp()
+        name = re.split(r'\s{2,}', line[2:].strip())[0]
+        if 'LE Meta Event' in name and i + 1 < len(lines):
+            name = lines[i + 1].strip()
+        if re.search(r'Scan Enable|Advertising Report', name):
+            tr.point(t, 'Bluetooth scanning', name[:50])
+        elif re.search(r'Create Connection|Connection Complete|Disconnect', name):
+            tr.point(t, 'Bluetooth connect/disconnect', name[:50])
+        elif name.startswith('ACL Data'):
+            tr.point(t, 'Bluetooth data')
+
+
+def link_samples(tr, path):
+    try:
+        lines = open(path, errors='replace').read().splitlines()
+    except OSError:
+        return
+    t, section, cur, sta_freq = None, None, {}, None
+    for line in lines:
+        if line.startswith('### '):
+            if t is not None and cur:
+                tr.link.append((t, cur))
+            t, section, cur = float(line[4:]), None, {}
+        elif line.startswith('## group '):
+            section = 'group'
+        elif line.startswith('## sta '):
+            section = 'sta'
+        elif section == 'group':
+            m = re.match(r'\s*(tx retries|tx failed|inactive time|signal):\s*(-?\d+)', line)
+            if m:
+                cur[m[1]] = cur.get(m[1], 0) + int(m[2]) if m[1] in ('tx retries', 'tx failed') else int(m[2])
+        elif section == 'sta':
+            if 'Not connected' in line:
+                tr.point(t, 'station not connected')
+            m = re.match(r'\s*freq:\s*(\d+)', line)
+            if m:
+                if sta_freq and m[1] != sta_freq:
+                    tr.point(t, 'station channel change', f'{sta_freq} -> {m[1]} MHz')
+                sta_freq = m[1]
+    if t is not None and cur:
+        tr.link.append((t, cur))
+
+
+def load_capture(d):
+    tr = Trace()
+    try:
+        tr.context = open(f'{d}/context.txt').read().rstrip()
+    except OSError:
+        pass
+    last, first_t = {}, None
+    try:
+        rows = open(f'{d}/throughput.tsv').read().splitlines()[1:]
+    except OSError:
+        rows = []
+    for row in rows:
+        parts = row.split('\t', 2)
+        if len(parts) != 3:
+            continue
+        t, size, name = float(parts[0]), int(parts[1]), parts[2]
+        first_t = t if first_t is None else first_t
+        prev = last.get(name)
+        # A file already open at the first sample was partly received before the capture.
+        delta = size - prev if prev is not None else (0 if t == first_t else size)
+        last[name] = size
+        if delta > 0:
+            tr.growth.append((t, delta))
+    try:
+        journal_lines(tr, open(f'{d}/journal.log', errors='replace'), chunks=False)
+    except OSError:
+        pass
+    iw_events(tr, f'{d}/iw-event.log')
+    btmon_events(tr, f'{d}/btmon.log')
+    link_samples(tr, f'{d}/link.log')
+    return tr
+
+
+def load_journal(since, until):
+    tr = Trace()
+    out = subprocess.run(['journalctl', '-o', 'short-unix', '--no-pager', '--since', since, '--until', until],
+                         capture_output=True, text=True, errors='replace')
+    if out.returncode != 0:
+        sys.exit(f'qs-trace: journalctl failed: {out.stderr.strip()}')
+    journal_lines(tr, out.stdout.splitlines(), chunks=True)
+    tr.context = (f'From the journal, {since} to {until}: throughput counted from the receiver\'s '
+                  f'"Processing PayloadType::File" lines, ~{CHUNK // 1024} KiB each')
+    return tr
+
+
+def analyse(tr, min_stall):
+    print(tr.context)
+    print()
+    growth = sorted(tr.growth)
+    tr.points.sort()
+    tr.link.sort(key=lambda s: s[0])
+    if len(growth) < 2:
+        print('No transfer seen: nothing was received while this ran.')
+        if tr.points or tr.spans:
+            counts = {}
+            for _, kind, _ in tr.points:
+                counts[kind] = counts.get(kind, 0) + 1
+            for _, _, kind, _ in tr.spans:
+                counts[kind] = counts.get(kind, 0) + 1
+            print('Events recorded: ' + ', '.join(f'{k} ×{n}' for k, n in sorted(counts.items())))
+        return
+    t0, t1 = growth[0][0], growth[-1][0]
+    total = sum(b for _, b in growth)
+    dur = max(t1 - t0, 0.001)
+    stalls = [(a, b) for (a, _), (b, _) in zip(growth, growth[1:]) if b - a >= min_stall]
+    stalled = sum(b - a for a, b in stalls)
+    print(f'Transfer: {hms(t0)} → {hms(t1)} ({dur:.0f} s), {mb(total):.0f} MB, {mb(total) / dur:.1f} MB/s average')
+    bins = [0] * (int(dur // 10) + 1)
+    for t, b in growth:
+        bins[int((t - t0) // 10)] += b
+    print('Every 10 s (MB/s): ' + ' '.join(f'{mb(b) / 10:.1f}' for b in bins))
+    print(f'Stalls of {min_stall:g} s or more: {len(stalls)}, {stalled:.0f} s in all '
+          f'({100 * stalled / dur:.0f}% of the transfer)')
+    print()
+
+    def in_window(a, b):
+        hits = {}
+        for t, kind, detail in tr.points:
+            if a <= t <= b:
+                hits.setdefault(kind, []).append(detail)
+        for s, e, kind, detail in tr.spans:
+            if s <= b and e >= a:
+                hits.setdefault(kind, []).append(detail)
+        return hits
+
+    def link_delta(a, b, field):
+        before = [v for t, v in tr.link if t <= a and field in v]
+        after = [v for t, v in tr.link if t <= b and field in v]
+        if not before or not after:
+            return None
+        return after[-1][field] - before[-1][field]
+
+    kinds = sorted({k for _, k, _ in tr.points} | {k for _, _, k, _ in tr.spans})
+    if stalls:
+        print(f'Stalls, and what happened from {PRE:g} s before each until it ended:')
+        for a, b in stalls:
+            hits = in_window(a - PRE, b)
+            parts = []
+            for kind, details in sorted(hits.items()):
+                first = next((d for d in details if d), '')
+                parts.append(f'{kind} ×{len(details)}' + (f' ({first})' if first else ''))
+            r = link_delta(a - PRE, b, 'tx retries')
+            f = link_delta(a - PRE, b, 'tx failed')
+            if r:
+                parts.append(f'tx retries +{r}')
+            if f:
+                parts.append(f'tx failed +{f}')
+            print(f'  {hms(a)}  {b - a:5.1f} s  ' + (' · '.join(parts) if parts else 'nothing recorded'))
+        print()
+
+        flow = dur - stalled
+        rows = []
+        for kind in kinds:
+            n = sum(1 for a, b in stalls if kind in in_window(a - PRE, b))
+            outside = sum(1 for t, k, _ in tr.points if k == kind and t0 <= t <= t1
+                          and not any(a - PRE <= t <= b for a, b in stalls))
+            outside += sum(1 for s, e, k, _ in tr.spans if k == kind and s <= t1 and e >= t0
+                           and not any(s <= b and e >= a - PRE for a, b in stalls))
+            if n or outside:
+                rows.append((n, kind, outside * 60 / flow if flow > 0 else 0.0))
+        r_all = link_delta(t0, t1, 'tx retries')
+        if r_all is not None:
+            in_stalls = sum(link_delta(a - PRE, b, 'tx retries') or 0 for a, b in stalls)
+            rows.append((sum(1 for a, b in stalls if (link_delta(a - PRE, b, 'tx retries') or 0) > 0),
+                         'tx retries (group)', (r_all - in_stalls) * 60 / flow if flow > 0 else 0.0))
+        if rows:
+            print('What lines up with the stalls (stalls with at least one, and how often while data flowed):')
+            for n, kind, rate in sorted(rows, key=lambda r: (-r[0], r[1])):
+                print(f'  {kind:30} {n:3}/{len(stalls)} stalls   {rate:6.1f}/min while flowing')
+            print()
+            print('A kind present in most stalls but rare while data flows is the one to chase.')
+    elif kinds:
+        print('No stalls. Events during the transfer: ' +
+              ', '.join(f'{k} ×{len(v)}' for k, v in sorted(in_window(t0, t1).items())))
+
+
+def main(argv):
+    min_stall, args = 2.0, []
+    i = 0
+    while i < len(argv):
+        if argv[i] == '--min-stall':
+            min_stall = float(argv[i + 1])
+            i += 2
+        else:
+            args.append(argv[i])
+            i += 1
+    if len(args) == 3 and args[0] == '--journal':
+        tr = load_journal(args[1], args[2])
+    elif len(args) == 1:
+        tr = load_capture(args[0])
+    else:
+        sys.exit('usage: qs-trace report DIR | qs-trace report --journal SINCE UNTIL [--min-stall S]')
+    analyse(tr, min_stall)
+
+
+main(sys.argv[1:])
+PY
+}
+
+case ${1:-} in
+  report) shift; report "$@" ;;
+  -h|--help) usage 0 ;;
+  *) capture "$@" ;;
+esac

@@ -166,7 +166,7 @@ BarWidget {
       : root.incoming ? incomingText()
       : root.receiving ? "Quick Share: this PC can receive" : "Quick Share: receiving is off"
     var click = root.sending ? "Click: cancel sending" : "Click: send a file"
-    return head + (root.fast && !root.busy ? "\nFast Wi-Fi on (Wi-Fi pauses during transfers)" : "")
+    return head + (root.fast && !root.busy ? "\nFast Wi-Fi on" : "")
       + "\n" + click + " · Middle: open Downloads · Right: menu"
   }
 
