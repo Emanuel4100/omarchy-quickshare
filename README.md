@@ -107,7 +107,7 @@ The helper runs from a root-owned copy that a plugin update doesn't touch. `inst
 
 Bluetooth and Wi-Fi share one chip and its antennas on most laptop and desktop cards, and the Wi-Fi Direct link runs on 2.4 GHz, where Bluetooth lives. Headphones playing over a high-bitrate codec such as LDAC (Sony) take so much airtime that a transfer crawls at about 1 MB/s with pauses of several seconds. With the audio off, the same link moves 5–6 MB/s.
 
-So while a transfer of 50 MB or more runs over Wi-Fi Direct, connected headphones switch to AAC (or SBC), and switch back when it ends. You hear a short gap at each switch, and a notification says why. Transfers over your home network and smaller files leave the headphones alone, and so does a codec you change yourself in the meantime. `quickshare audio 200` changes the size; `quickshare audio off` turns it off.
+So while a transfer of 50 MB or more runs over Wi-Fi Direct, connected headphones switch to AAC (or SBC), and switch back when it ends. You hear a gap of about half a second at each switch, and a notification says why. Players that pause when the headphones' output goes away (Spotify does) are resumed. Transfers over your home network and smaller files leave the headphones alone, and so does a codec you change yourself in the meantime. `quickshare audio 200` changes the size; `quickshare audio off` turns it off.
 
 Why NetworkManager breaks Wi-Fi Direct, everything tried around it, and measurements: [docs/wifi-direct-notes.md](docs/wifi-direct-notes.md). To see where a slow transfer stalls, run `sudo scripts/qs-trace` while it runs (section 5 there).
 
