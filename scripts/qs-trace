@@ -298,27 +298,42 @@ def iw_events(tr, path):
 
 
 def btmon_events(tr, path):
+    # Header lines, optionally behind the process that caused them (btmon 5.8x):
+    #   "bluetoothd[1071]: < ACL: Handle 256        #1 [hci0] 2026-11-14 12:01:28.553469"
+    #   "> HCI Event: LE Meta Event (0x3e) plen 43  #12 [hci0] 2026-11-14 ..." (subevent on the next line)
     ts = re.compile(r'(\d{4}-\d\d-\d\d) (\d\d:\d\d:\d\d\.\d+)\s*$')
+    prefix = re.compile(r'^\S+\[\d+\]: ')
     try:
-        lines = open(path, errors='replace').read().splitlines()
+        f = open(path, errors='replace')
     except OSError:
         return
-    for i, line in enumerate(lines):
-        if not line[:2] in ('< ', '> '):
-            continue
-        m = ts.search(line)
-        if not m:
-            continue
-        t = datetime.datetime.strptime(f'{m[1]} {m[2]}', '%Y-%m-%d %H:%M:%S.%f').timestamp()
-        name = re.split(r'\s{2,}', line[2:].strip())[0]
-        if 'LE Meta Event' in name and i + 1 < len(lines):
-            name = lines[i + 1].strip()
-        if re.search(r'Scan Enable|Advertising Report', name):
-            tr.point(t, 'Bluetooth scanning', name[:50])
-        elif re.search(r'Create Connection|Connection Complete|Disconnect', name):
-            tr.point(t, 'Bluetooth connect/disconnect', name[:50])
-        elif name.startswith('ACL Data'):
-            tr.point(t, 'Bluetooth data')
+    meta_t = None  # time of an LE Meta Event whose subevent is on the next line
+    with f:
+        for line in f:
+            if meta_t is not None:
+                name, t, meta_t = line.strip(), meta_t, None
+            else:
+                if line[:1] in (' ', '\t', '\n'):
+                    continue
+                line = prefix.sub('', line, count=1)
+                if line[:2] not in ('< ', '> '):
+                    continue
+                m = ts.search(line)
+                if not m:
+                    continue
+                t = datetime.datetime.strptime(f'{m[1]} {m[2]}', '%Y-%m-%d %H:%M:%S.%f').timestamp()
+                name = re.split(r'\s{2,}', line[2:].strip())[0]
+                if 'LE Meta Event' in name:
+                    meta_t = t
+                    continue
+            if re.search(r'Scan Enable|Advertising Report', name):
+                tr.point(t, 'Bluetooth scanning', name[:50])
+            elif re.search(r'Create Connection|Connection Complete|Disconnect', name):
+                tr.point(t, 'Bluetooth connect/disconnect', name[:50])
+            elif name.startswith(('ACL', 'SCO', 'ISO')):
+                tr.point(t, 'Bluetooth data')   # classic ACL: audio streaming, file transfers
+            elif name.startswith('LE-ACL'):
+                tr.point(t, 'Bluetooth LE data')
 
 
 def link_samples(tr, path):
@@ -425,6 +440,24 @@ def analyse(tr, min_stall):
     print('Every 10 s (MB/s): ' + ' '.join(f'{mb(b) / 10:.1f}' for b in bins))
     print(f'Stalls of {min_stall:g} s or more: {len(stalls)}, {stalled:.0f} s in all '
           f'({100 * stalled / dur:.0f}% of the transfer)')
+    # Bluetooth shares the 2.4 GHz radio (and on combo cards the antenna) with the Wi-Fi Direct
+    # link: compare the seconds with and without Bluetooth data going out or in.
+    bt = [t for t, k, _ in tr.points if k == 'Bluetooth data' and t0 <= t <= t1]
+    if bt:
+        per_s = {}
+        for t in bt:
+            per_s[int(t)] = per_s.get(int(t), 0) + 1
+        got = {}
+        for t, b in growth:
+            got[int(t)] = got.get(int(t), 0) + b
+        secs = range(int(t0), int(t1) + 1)
+        busy = [s for s in secs if per_s.get(s, 0) >= 20]
+        quiet = [s for s in secs if per_s.get(s, 0) == 0]
+        print(f'Bluetooth data during the transfer: {len(bt) / dur:.0f} packets/s on average'
+              + (' (a steady stream like this is usually Bluetooth audio)' if len(bt) / dur >= 50 else ''))
+        for label, group in (('with Bluetooth data flowing', busy), ('with none', quiet)):
+            if group:
+                print(f'  {label}: {mb(sum(got.get(s, 0) for s in group)) / len(group):.1f} MB/s over {len(group)} s')
     print()
 
     def in_window(a, b):

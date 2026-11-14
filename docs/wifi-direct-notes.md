@@ -18,7 +18,7 @@ Last updated 2026-11-14 (section 5 re-reads the Nov 4 tests). Test setup:
 | PC → Galaxy phone: finding the phone | Fixed in v1.2.0 with a wake-up beacon (section 1). |
 | PC → Galaxy phone: the transfer itself | Not confirmed yet. |
 | Fast transfers that keep the PC's Wi-Fi connected | Works with stock NetworkManager since 2026-11-14: a D-Bus rule refuses NetworkManager's teardown call for a second while the group starts (§3, #9). Confirmed with a 197 MB transfer from the S24 Ultra; the Wi-Fi stayed connected throughout. The NetworkManager patch (section 4) does the same from the inside. |
-| Transfer speed | Transfers run either slowly (about 1 MB/s with stalls of several seconds) or fast (5–9 MB/s), with or without the patch. The cause isn't known yet (section 5). |
+| Transfer speed | Slow transfers (about 1 MB/s with stalls of several seconds) come from Bluetooth headphones streaming LDAC next to the 2.4 GHz link; without them it runs at 5–6 MB/s. Since v1.4.0 the headphones drop to AAC during big transfers (section 5). |
 
 ## 1. Sending to Samsung phones: the wake-up beacon
 
@@ -225,20 +225,32 @@ Test runs: send the same ~500 MB video each time, and note when the phone's scre
 | D | as B, PC on the router's 2.4 GHz band (the group then shares its channel) | as A | it's channel hopping on the PC |
 | E | as B, with the PC's other Bluetooth jobs stopped (sensor timers, KDE Connect) | as A | it's Bluetooth next to the 2.4 GHz group |
 
+### The answer: Bluetooth audio (2026-11-14)
+
+A `qs-trace` capture with the fixed Bluetooth parser showed the PC streaming audio to Sony WH-1000XM5 headphones over LDAC the whole time: 123 packets/s of A2DP. The AX210 does Bluetooth on the same chip and antennas, and the Wi-Fi Direct group is on 2.4 GHz.
+
+| 587 MB from the S24 Ultra, Wi-Fi kept | Bluetooth audio | Speed |
+|---|---|---|
+| 12:01:53–12:05:31 | LDAC, 125 packets/s | 1.0 MB/s, 13 stalls of 2–11 s, every one during the stream |
+| 12:05:32–12:05:35 (headphones switched off) | none | 2.6 → 5.8 → 6.3 → 5.2 MB/s |
+| 12:41, 196 MB, music still playing on AAC | AAC, 47 packets/s | 4.1 MB/s, no stalls |
+
+The audio was steady through the stalls, so the stalls don't follow single Bluetooth events. They look like TCP backing off on a link that keeps losing airtime (each stall ends with a burst of 3–8 MB/s). The slow-then-fast switches of Nov 4 match music stopping, and so do the runs that were fast throughout.
+
+Also seen that day: once the receiver restarted, the phone found the PC through mDNS on the home network and sent 450 MB over it at 6.0 MB/s with no stalls. That path is the router's 5 GHz, so it doesn't fight Bluetooth. quickshare-direct prefers Wi-Fi Direct on purpose, because its developer measured 33–37 MB/s for an 80 MHz direct link against 2.4 MB/s through a router. That isn't true for cards that can only start the group on 2.4 GHz. The phone's `MediumMetadata` doesn't say which network it's on (bssid and IP are empty), so the receiver can't tell when the home network would be better. `QSD_BWU=lan` forces it, with no fallback for a phone elsewhere.
+
+**Fix in v1.4.0:** while a transfer of 50 MB or more (`quickshare audio`) runs over Wi-Fi Direct, connected headphones on a heavier codec than AAC/SBC switch to AAC (else SBC), and switch back when it ends. This is done by `quickshare audio-guard`, a user service started with the receiver. It reads the size from the consent line, and the link's start and end from "Hotspot: … up" and "Hotspot: stopping". It leaves alone a codec you change yourself in the meantime, and puts the old one back if it's killed.
+
 ## 6. Next steps
 
-- **Find what makes the slow phase:** the test runs above, then the matching fix:
-  - PC scans: hold them off while the link is up.
-  - The phone: document the setting that avoids it.
-  - Bluetooth: quiet the Bluetooth jobs during transfers.
-- **Plugin:** release #9 (confirmed with a 197 MB transfer on 2026-11-14).
+- **Upstream (quickshare-direct):** offer the home network when the phone is on it, and the Wi-Fi Direct group only otherwise, at least when the group can't go on 5 GHz.
 - **NetworkManager:** carry the patch as a local Arch package (Arch's PKGBUILD plus the patch; roll back with the cached stock package), and propose it upstream on NetworkManager's GitLab.
 - **Sending:** confirm a PC → S24 transfer end to end. Report the missing beacon to quickshare-direct.
 
 ## Picking this up on another machine
 
 ```bash
-omarchy plugin update emanuel.quickshare            # v1.3.0 and these notes
+omarchy plugin update emanuel.quickshare            # v1.4.0 and these notes
 git clone https://github.com/Emanuel4100/omarchy-quickshare ~/Projects/omarchy-quickshare
 git -C ~/Projects/omarchy-quickshare switch wip/keep-wifi   # only for approach #4
 git clone git@github.com:Emanuel4100/nm-p2p-group-fix.git ~/Projects/nm-p2p-group-fix

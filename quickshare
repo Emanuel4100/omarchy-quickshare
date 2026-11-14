@@ -10,6 +10,7 @@
 #   quickshare devices             list phones in receive mode nearby
 #   quickshare downloads           open the folder received files go to
 #   quickshare fast on|off         Wi-Fi Direct for transfers (the PC's Wi-Fi stays up if it can)
+#   quickshare audio [off|MB]      Bluetooth headphones drop to a lower bitrate for bigger transfers
 #   quickshare trust [add|remove NAME]  devices whose files are accepted without asking
 #   quickshare menu                everything above in an Omarchy menu (the bar's right click)
 #   quickshare doctor              check the setup and say how to fix what's missing
@@ -23,11 +24,16 @@ fast_dropin=/etc/systemd/system/quickshare-ap@.service.d/50-omarchy-fastlink.con
 hold_policy=/etc/dbus-1/system.d/zz-quickshare-hold-group.conf
 env_file=$HOME/.config/quickshare-direct/env
 trusted_file=$HOME/.config/quickshare-direct/trusted
+# Transfers from this size (MB) lower the headphones' bitrate ("off": never); see audio_guard.
+audio_file=$HOME/.config/quickshare-direct/audio
+audio_unit=quickshare-audio-guard.service
 cache_dir=${XDG_CACHE_HOME:-$HOME/.cache}/quickshare-direct
 state_dir=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/quickshare
 # The send in progress, for the bar: {pid, title, detail, result, at}. Our notify-send shim
 # keeps title/detail up to date from quickshare-direct's own status notifications.
 send_state=$state_dir/send.json
+# Headphones whose codec audio_guard lowered: card<TAB>profile before<TAB>profile it set.
+audio_state=$state_dir/audio-switched
 
 # Our notify-send shim turns Accept/Decline (and the "several devices" question)
 # into an Omarchy menu; see bin/notify-send.
@@ -114,6 +120,100 @@ menu_stop_receiving() {
     [[ $choice == "Stop anyway" ]] || return 0
   fi
   set_receive off --force "the menu"
+}
+
+# Bluetooth headphones and Wi-Fi Direct. The Wi-Fi card does Bluetooth too (Intel AX210: one chip,
+# shared antennas), and the Wi-Fi Direct link runs on 2.4 GHz, where Bluetooth lives. A
+# high-bitrate stream such as LDAC takes so much airtime that transfers crawl at ~1 MB/s with stalls
+# of several seconds instead of 5-6 MB/s (measured 2026-11-14, docs/wifi-direct-notes.md). So while
+# a transfer of at least `quickshare audio` MB runs over our Wi-Fi Direct group or hotspot,
+# connected headphones on such a codec switch to AAC (else SBC), and switch back when it ends.
+# Transfers over the home network (5 GHz there) and over Bluetooth are left alone.
+audio_threshold() {
+  local v
+  v=$(cat "$audio_file" 2>/dev/null)
+  if [[ $v == off || $v =~ ^[0-9]+$ ]]; then echo "$v"; else echo 50; fi
+}
+
+# "card<TAB>active profile<TAB>lower profile" for each Bluetooth card playing A2DP on a codec heavier
+# than AAC/SBC (LDAC, aptX (HD), SBC-XQ, Opus, ...) that offers AAC or SBC.
+audio_heavy_cards() {
+  pactl -f json list cards 2>/dev/null | jq -r '
+    .[] | select(.name | startswith("bluez_card."))
+    | .active_profile as $p | .profiles as $all
+    | select($p | startswith("a2dp-sink"))
+    | select(($all[$p].description // "") | test("codec (SBC|AAC|FastStream)\\)") | not)
+    | (if $all["a2dp-sink-aac"].available then "a2dp-sink-aac"
+       elif $all["a2dp-sink-sbc"].available then "a2dp-sink-sbc" else empty end) as $to
+    | select($to != $p)
+    | "\(.name)\t\($p)\t\($to)"' 2>/dev/null
+}
+
+audio_lower() {
+  local name from to switched=0
+  mkdir -p "$state_dir"
+  while IFS=$'\t' read -r name from to; do
+    [[ -n $name ]] || continue
+    pactl set-card-profile "$name" "$to" 2>/dev/null || continue
+    printf '%s\t%s\t%s\n' "$name" "$from" "$to" >> "$audio_state"
+    logger -t quickshare "headphones $name: $from -> $to for a $1 MB transfer"
+    switched=1
+  done < <(audio_heavy_cards)
+  (( switched )) && notify-send --app-name="Quick Share" --icon=audio-headphones --expire-time=6000 \
+    "Headphones on a lower bitrate" "Bluetooth audio slows Wi-Fi Direct down; back to normal when this $1 MB transfer ends."
+  return 0
+}
+
+# Put back what audio_lower changed, unless the profile was changed again since.
+audio_restore() {
+  local name from to now
+  [[ -s $audio_state ]] || return 0
+  while IFS=$'\t' read -r name from to; do
+    now=$(pactl -f json list cards 2>/dev/null | jq -r --arg n "$name" '.[] | select(.name == $n) | .active_profile')
+    if [[ $now == "$to" ]] && pactl set-card-profile "$name" "$from" 2>/dev/null; then
+      logger -t quickshare "headphones $name: back to $from"
+    fi
+  done < "$audio_state"
+  rm -f "$audio_state"
+}
+
+# The service (quickshare-audio-guard.service, started and stopped with the receiver): follow the
+# receiver's log. The size comes with the consent prompt; the group/hotspot logs "Hotspot: X up"
+# once it's ready (before the phone joins) and "Hotspot: stopping" at the end.
+audio_guard() {
+  local line total=0 link=0 thr
+  audio_restore  # left over from a guard that was killed
+  trap audio_restore EXIT
+  trap 'exit 0' TERM INT
+  while IFS= read -r line; do
+    case $line in
+      *"RemoteDeviceInfo:"*) total=0 ;;
+      *"Asking for user consent"*) [[ $line =~ total_bytes:\ ([0-9]+) ]] && total=${BASH_REMATCH[1]} ;;
+      *"Hotspot: "*" up "*) link=1 ;;
+      *"Hotspot: stopping"* | *"Transfer finished"* | *"Transfer canceled"* | *declined* | *"Stopping."*)
+        link=0 total=0
+        audio_restore
+        continue ;;
+      *) continue ;;
+    esac
+    thr=$(audio_threshold)
+    if (( link )) && [[ $thr != off ]] && (( total >= thr * 1000000 )) && [[ ! -s $audio_state ]]; then
+      audio_lower $(( total / 1000000 ))
+    fi
+  done < <(journalctl --user -u "$unit" -f -n 0 -o cat)
+}
+
+set_audio() {
+  local v=${1:-}
+  case $v in
+    '') if [[ $(audio_threshold) == off ]]; then echo off; else echo "on: transfers from $(audio_threshold) MB"; fi ;;
+    off | 0) mkdir -p "${audio_file%/*}"; echo off > "$audio_file"; echo "Headphones keep their codec during transfers" ;;
+    *)
+      [[ $v =~ ^[0-9]+$ ]] || die "audio takes off or a size in MB (default 50)"
+      mkdir -p "${audio_file%/*}"
+      echo "$v" > "$audio_file"
+      echo "Bluetooth headphones drop to AAC/SBC while a transfer of $v MB or more runs over Wi-Fi Direct" ;;
+  esac
 }
 
 # quickshare-direct's own Wi-Fi Direct link dies at once under NetworkManager, so
@@ -382,6 +482,15 @@ doctor() {
       fail "Fast Wi-Fi: its helper doesn't match this version of the plugin" "quickshare fast on"
     elif fast; then pass "Fast Wi-Fi: on"
     else warn "Fast Wi-Fi: off, transfers use Bluetooth (quickshare fast on)"; fi
+    if [[ $(audio_threshold) == off ]]; then
+      warn "Headphones keep their codec during transfers; Bluetooth audio slows Wi-Fi Direct (quickshare audio 50)"
+    elif ! systemctl --user is-enabled -q "$audio_unit" 2>/dev/null; then
+      fail "Headphones: the service that lowers their bitrate during transfers isn't set up" "$here/install.sh"
+    elif receiving && ! systemctl --user is-active -q "$audio_unit"; then
+      fail "Headphones: the service that lowers their bitrate during transfers isn't running" "systemctl --user restart $unit"
+    else
+      pass "Headphones: lower bitrate during transfers from $(audio_threshold) MB"
+    fi
     if [[ -e $hold_policy ]] && ! systemctl is-active -q "quickshare-ap@$USER.service"; then
       fail "Fast Wi-Fi: a D-Bus policy from a helper that died is still in place" \
         "sudo sh -c 'rm $hold_policy && busctl call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus ReloadConfig'"
@@ -468,9 +577,12 @@ case ${1:-status} in
   cancel) cancel ;;
   devices) devices ;;
   fast) set_fast "${2:-}" ;;
+  audio) set_audio "${2:-}" ;;
+  audio-guard) audio_guard ;;
+  audio-restore) audio_restore ;;
   trust) shift; trust "$@" ;;
   downloads) xdg-open "$(downloads_dir)" >/dev/null 2>&1 & ;;
   menu) menu ;;
   doctor) doctor ;;
-  *) sed -n '6,15p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '6,16p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

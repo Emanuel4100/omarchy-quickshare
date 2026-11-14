@@ -26,6 +26,8 @@ FAST_HELPER=/usr/local/lib/omarchy-quickshare/quickshare-fastlink
 FAST_DROPIN=/etc/systemd/system/quickshare-ap@.service.d/50-omarchy-fastlink.conf
 REGDOM_FILE=/etc/conf.d/wireless-regdom
 UNIT=quickshare-direct.service
+AUDIO_UNIT=quickshare-audio-guard.service
+AUDIO_UNIT_FILE=$HOME/.config/systemd/user/$AUDIO_UNIT
 export PATH="$OMARCHY_BIN:$HOME/.local/bin:$PATH"
 
 if [[ -t 1 ]]; then
@@ -269,6 +271,20 @@ start_receiver() {
   fi
 }
 
+# Bluetooth headphones share the Wi-Fi card's 2.4 GHz radio with Wi-Fi Direct: a user service lowers
+# their bitrate while a big transfer runs (`quickshare audio`).
+setup_audio_guard() {
+  step "Bluetooth headphones during transfers"
+  mkdir -p "${AUDIO_UNIT_FILE%/*}"
+  if ! cmp -s "$PLUGIN_DIR/systemd/$AUDIO_UNIT" "$AUDIO_UNIT_FILE"; then
+    install -m644 "$PLUGIN_DIR/systemd/$AUDIO_UNIT" "$AUDIO_UNIT_FILE"
+    systemctl --user daemon-reload
+  fi
+  systemctl --user enable -q "$AUDIO_UNIT"
+  if systemctl --user is-active -q "$UNIT"; then systemctl --user restart "$AUDIO_UNIT"; fi
+  ok "lower bitrate during transfers: $("$PLUGIN_DIR/quickshare" audio) (change it: quickshare audio MB|off)"
+}
+
 add_to_bar() {
   step "Bar icon"
   if omarchy plugin list --json | jq -e --arg id "$ID" 'any(.[]; .id == $id and .enabled)' >/dev/null; then
@@ -315,6 +331,7 @@ do_install() {
   install_beacon_deps
   add_send_to
   start_receiver
+  setup_audio_guard
   add_to_bar
   offer_fast_mode
 
@@ -330,6 +347,13 @@ uninstall() {
   if systemctl --user cat "$UNIT" >/dev/null 2>&1; then
     systemctl --user disable --now "$UNIT" 2>/dev/null || true
     ok "receiving off"
+  fi
+  if [[ -e $AUDIO_UNIT_FILE ]]; then
+    systemctl --user disable --now -q "$AUDIO_UNIT" 2>/dev/null || true
+    "$PLUGIN_DIR/quickshare" audio-restore 2>/dev/null || true
+    rm -f "$AUDIO_UNIT_FILE"
+    systemctl --user daemon-reload
+    ok "headphone service removed"
   fi
   if [[ -f $ENV_FILE ]] && grep -q "^PATH=$(readlink -f "$PLUGIN_DIR")/bin:" "$ENV_FILE"; then
     sed -i '\|^PATH='"$(readlink -f "$PLUGIN_DIR")"'/bin:|d' "$ENV_FILE"

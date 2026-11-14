@@ -44,6 +44,7 @@ If you only run the first command, the bar icon says *"isn't set up yet"*. Click
 | Sending | Installs `python-dbus` and `python-gobject`, for the Bluetooth beacon that wakes up the phone ([why](#sending)) | yes |
 | File manager | Adds **Send to phone (Quick Share)** to Nautilus' right-click → Scripts | |
 | Receiving | `systemctl --user enable --now quickshare-direct` | |
+| Headphones | Installs `quickshare-audio-guard.service` in `~/.config/systemd/user`; it runs alongside the receiver ([why](#bluetooth-headphones)) | |
 | Bar | `omarchy plugin enable emanuel.quickshare` | |
 | Fast Wi-Fi | Asks once, default **no** ([details](#faster-transfers)) | yes |
 
@@ -71,6 +72,7 @@ quickshare cancel                 # stop the send in progress
 quickshare devices                # which phones the PC can see (Bluetooth and Wi-Fi)
 quickshare receive on|off|toggle  # off during a transfer needs --force
 quickshare fast on|off
+quickshare audio 100|off           # headphones' lower bitrate: from which size, or never
 quickshare trust                  # list, or: trust add|remove "Emanuel's Tab S9+"
 quickshare menu                   # the right-click menu
 quickshare doctor                 # check the setup
@@ -100,6 +102,12 @@ The journal says which way a transfer took: `journalctl -u 'quickshare-ap@*' -g 
 The helper runs from a root-owned copy that a plugin update doesn't touch. `install.sh` refreshes it, and `quickshare doctor` flags a copy that doesn't match the plugin.
 
 </details>
+
+### Bluetooth headphones
+
+Bluetooth and Wi-Fi share one chip and its antennas on most laptop and desktop cards, and the Wi-Fi Direct link runs on 2.4 GHz, where Bluetooth lives. Headphones playing over a high-bitrate codec such as LDAC (Sony) take so much airtime that a transfer crawls at about 1 MB/s with pauses of several seconds. With the audio off, the same link moves 5–6 MB/s.
+
+So while a transfer of 50 MB or more runs over Wi-Fi Direct, connected headphones switch to AAC (or SBC), and switch back when it ends. You hear a short gap at each switch, and a notification says why. Transfers over your home network and smaller files leave the headphones alone, and so does a codec you change yourself in the meantime. `quickshare audio 200` changes the size; `quickshare audio off` turns it off.
 
 Why NetworkManager breaks Wi-Fi Direct, everything tried around it, and measurements: [docs/wifi-direct-notes.md](docs/wifi-direct-notes.md). To see where a slow transfer stalls, run `sudo scripts/qs-trace` while it runs (section 5 there).
 

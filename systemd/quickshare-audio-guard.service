@@ -1,0 +1,16 @@
+# emanuel.quickshare: while a big transfer runs over Wi-Fi Direct, connected Bluetooth headphones
+# drop to a lower-bitrate codec (they share the Wi-Fi card's 2.4 GHz radio). Installed by
+# install.sh into ~/.config/systemd/user; starts and stops with the receiver. See `quickshare audio`.
+[Unit]
+Description=Quick Share: lower Bluetooth headphones' bitrate during big Wi-Fi Direct transfers
+BindsTo=quickshare-direct.service
+After=quickshare-direct.service
+
+[Service]
+ExecStart=%h/.config/omarchy/plugins/emanuel.quickshare/quickshare audio-guard
+ExecStopPost=%h/.config/omarchy/plugins/emanuel.quickshare/quickshare audio-restore
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=quickshare-direct.service
